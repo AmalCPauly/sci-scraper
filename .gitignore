@@ -2,3 +2,7 @@ venv/
 __pycache__/
 *.pyc
 .env
+downloads*
+*.html
+*.js
+ajax-response.json
