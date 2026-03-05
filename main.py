@@ -743,11 +743,16 @@ def is_pdf_reportable(pdf_path: Path) -> bool:
         except Exception:
             page_text = ""
         if page_text:
-            text_parts.append(page_text.upper())
+            text_parts.append(page_text)
     text = " ".join(text_parts)
-    if "NON-REPORTABLE" in text or "NON REPORTABLE" in text:
+    text = re.sub(r"\s+", " ", text, flags=re.MULTILINE).strip()
+    lower = text.lower()
+
+    # Reject any explicit non-reportable marker, including hyphen/space variants.
+    if re.search(r"\bnon\s*[-–]?\s*reportable\b", lower):
         return False
-    return "REPORTABLE" in text
+    # Accept only if reportable token exists as a standalone word.
+    return bool(re.search(r"\breportable\b", lower))
 
 
 def build_url_with_query(url: str, params: Dict[str, object]) -> str:
@@ -1209,7 +1214,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reportable-check",
-        default="metadata_or_pdf",
+        default="pdf",
         choices=["metadata", "metadata_or_pdf", "pdf"],
         help=(
             "How to classify reportable records when --reportable-mode=reportable: "
