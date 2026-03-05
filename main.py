@@ -15,7 +15,6 @@ from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
-from pypdf import PdfReader
 
 
 DATE_CANDIDATE_FORMATS = [
@@ -24,6 +23,8 @@ DATE_CANDIDATE_FORMATS = [
     "%d-%m-%Y",
     "%d/%m/%Y",
     "%d.%m.%Y",
+    "%d-%b-%Y",
+    "%d-%B-%Y",
     "%d %b %Y",
     "%d %B %Y",
 ]
@@ -35,6 +36,12 @@ class JudgmentRecord:
     case_title: str
     judgment_date: date
     pdf_url: str
+    neutral_citation: Optional[str] = None
+    diary_number: Optional[str] = None
+    case_number: Optional[str] = None
+    petitioner_respondent: Optional[str] = None
+    petitioner_respondent_advocate: Optional[str] = None
+    judgment_by: Optional[str] = None
     detail_url: Optional[str] = None
     bench: Optional[str] = None
     citation: Optional[str] = None
@@ -73,9 +80,16 @@ class DownloadState:
 
     def is_downloaded(self, source_id: str) -> bool:
         row = self.conn.execute(
-            "SELECT status FROM downloads WHERE source_id = ?", (source_id,)
+            "SELECT status, local_path FROM downloads WHERE source_id = ?", (source_id,)
         ).fetchone()
-        return bool(row and row[0] == "downloaded")
+        if not row:
+            return False
+        status, local_path = row
+        if status != "downloaded":
+            return False
+        if not local_path:
+            return False
+        return Path(local_path).exists()
 
     def mark_downloaded(self, record: JudgmentRecord, local_path: Path) -> None:
         self.conn.execute(
@@ -184,22 +198,39 @@ class SciJudgmentScraper:
         self._init_csv_files()
 
     def _init_csv_files(self) -> None:
+        metadata_header = [
+            "neutral_citation",
+            "source_id",
+            "diary_number",
+            "case_number",
+            "petitioner_respondent",
+            "case_title",
+            "petitioner_respondent_advocate",
+            "judgment_date",
+            "judgment_by",
+            "bench",
+            "citation",
+            "reportable_raw",
+            "detail_url",
+            "pdf_url",
+            "local_path",
+        ]
+        if self.metadata_path.exists():
+            try:
+                with self.metadata_path.open("r", newline="", encoding="utf-8") as f:
+                    first_row = next(csv.reader(f), [])
+                if first_row != metadata_header:
+                    rotated = self.metadata_path.with_name(
+                        f"metadata_legacy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    )
+                    self.metadata_path.replace(rotated)
+                    logging.warning("Existing metadata.csv schema changed. Rotated to %s", rotated)
+            except Exception:
+                pass
         if not self.metadata_path.exists():
             with self.metadata_path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(
-                    [
-                        "source_id",
-                        "case_title",
-                        "judgment_date",
-                        "bench",
-                        "citation",
-                        "reportable_raw",
-                        "detail_url",
-                        "pdf_url",
-                        "local_path",
-                    ]
-                )
+                writer.writerow(metadata_header)
 
         if not self.failure_log_path.exists():
             with self.failure_log_path.open("w", newline="", encoding="utf-8") as f:
@@ -305,6 +336,11 @@ class SciJudgmentScraper:
                         except Exception:
                             pass
                         continue
+
+                neutral = extract_neutral_citation_from_pdf(local_path) or record.neutral_citation
+                if neutral:
+                    record.neutral_citation = neutral
+                    local_path = self.rename_with_neutral_citation(local_path, neutral)
 
                 self.state.mark_downloaded(record, local_path)
                 self.write_metadata(record, local_path)
@@ -620,8 +656,9 @@ class SciJudgmentScraper:
         target_dir = self.output_dir / str(record.judgment_date.year) / f"{record.judgment_date.month:02d}"
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_title = sanitize_filename(record.case_title)
-        filename = f"{record.judgment_date.isoformat()}_{safe_title}.pdf"
+        case_title_for_file = record.petitioner_respondent or record.case_title
+        safe_title = format_case_title_for_filename(case_title_for_file)
+        filename = f"{record.judgment_date.strftime('%Y-%m-%d')}-{safe_title}.pdf"
         file_path = dedupe_path(target_dir / filename)
 
         if self.args.dry_run:
@@ -639,14 +676,31 @@ class SciJudgmentScraper:
                     f.write(chunk)
         return file_path
 
+    def rename_with_neutral_citation(self, file_path: Path, neutral_citation: str) -> Path:
+        neutral_token = normalize_neutral_citation_token(neutral_citation)
+        if not neutral_token:
+            return file_path
+        if file_path.stem.endswith(f"-{neutral_token}"):
+            return file_path
+        new_name = f"{file_path.stem}-{neutral_token}{file_path.suffix}"
+        candidate = dedupe_path(file_path.with_name(new_name))
+        file_path.rename(candidate)
+        return candidate
+
     def write_metadata(self, record: JudgmentRecord, local_path: Path) -> None:
         with self.metadata_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(
                 [
+                    record.neutral_citation or "",
                     record.source_id,
+                    record.diary_number or "",
+                    record.case_number or "",
+                    record.petitioner_respondent or record.case_title,
                     record.case_title,
+                    record.petitioner_respondent_advocate or "",
                     record.judgment_date.isoformat(),
+                    record.judgment_by or "",
                     record.bench or "",
                     record.citation or "",
                     record.reportable_raw or "",
@@ -702,6 +756,17 @@ def sanitize_filename(value: str) -> str:
     return cleaned[:150] or "untitled"
 
 
+def format_case_title_for_filename(value: str) -> str:
+    text = normalize_ws(value)
+    text = re.sub(r"\bv\s*/\s*s\b", " vs ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bvs\.?\b", " vs ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[^A-Za-z0-9\s]+", " ", text)
+    text = normalize_ws(text).title()
+    text = re.sub(r"\bVs\b", "vs", text)
+    text = text.replace(" ", "_")
+    return text[:180] or "Untitled_Case"
+
+
 def dedupe_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -733,6 +798,7 @@ def is_non_reportable_value(value: Optional[str]) -> bool:
 
 def is_pdf_reportable(pdf_path: Path) -> bool:
     try:
+        from pypdf import PdfReader
         reader = PdfReader(str(pdf_path))
     except Exception:
         return False
@@ -753,6 +819,42 @@ def is_pdf_reportable(pdf_path: Path) -> bool:
         return False
     # Accept only if reportable token exists as a standalone word.
     return bool(re.search(r"\breportable\b", lower))
+
+
+def extract_neutral_citation_from_pdf(pdf_path: Path) -> Optional[str]:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(pdf_path))
+    except Exception:
+        return None
+
+    for page in reader.pages[:2]:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if not page_text:
+            continue
+        neutral = extract_neutral_citation_from_text(page_text)
+        if neutral:
+            return neutral
+    return None
+
+
+def extract_neutral_citation_from_text(text: str) -> Optional[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    m = re.search(r"\b(20\d{2})\s+INSC\s+(\d{1,5})\b", normalized, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return f"{m.group(1)} INSC {m.group(2)}"
+
+
+def normalize_neutral_citation_token(neutral_citation: str) -> str:
+    m = re.search(r"\b(20\d{2})\s+INSC\s+(\d{1,5})\b", neutral_citation, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    return f"{m.group(1)}_INSC_{m.group(2)}"
 
 
 def build_url_with_query(url: str, params: Dict[str, object]) -> str:
@@ -799,6 +901,12 @@ def parse_json_record(raw: Dict[str, object]) -> Optional[JudgmentRecord]:
         case_title=case_title,
         judgment_date=judgment_date,
         pdf_url=pdf_url,
+        neutral_citation=pick_str(raw, ["neutral_citation", "neutralCitation"]),
+        diary_number=pick_str(raw, ["diary_no", "diaryNumber"]),
+        case_number=pick_str(raw, ["case_number", "caseNo", "case_no"]),
+        petitioner_respondent=pick_str(raw, ["petitioner_respondent", "party_name"]),
+        petitioner_respondent_advocate=pick_str(raw, ["petitioner_respondent_advocate", "advocate"]),
+        judgment_by=pick_str(raw, ["judgment_by", "judgement_by"]),
         detail_url=pick_str(raw, ["detail_url", "detail", "permalink"]),
         bench=pick_str(raw, ["bench", "coram", "judges"]),
         citation=pick_str(raw, ["citation", "neutral_citation"]),
@@ -839,14 +947,18 @@ def parse_html_candidates(soup: BeautifulSoup, base_url: str) -> List[JudgmentRe
         row = link.find_parent("tr")
         if row is not None:
             row_text = row.get_text(" ", strip=True)
+            row_fields = extract_search_row_fields(row)
         else:
             row_text = link.parent.get_text(" ", strip=True) if link.parent else link_text
+            row_fields = {}
 
         maybe_date = extract_first_date(row_text)
         if not maybe_date:
+            maybe_date = extract_date_from_pdf_url(absolute)
+        if not maybe_date:
             continue
 
-        case_title = extract_case_title(row_text)
+        case_title = row_fields.get("petitioner_respondent") or extract_case_title(row_text)
         source_id = build_source_id_from_html(absolute, case_title, maybe_date)
         reportable_raw = infer_reportable_status(row_text, link_text)
 
@@ -856,8 +968,13 @@ def parse_html_candidates(soup: BeautifulSoup, base_url: str) -> List[JudgmentRe
                 case_title=case_title,
                 judgment_date=maybe_date,
                 pdf_url=absolute,
+                diary_number=row_fields.get("diary_number"),
+                case_number=row_fields.get("case_number"),
+                petitioner_respondent=row_fields.get("petitioner_respondent"),
+                petitioner_respondent_advocate=row_fields.get("petitioner_respondent_advocate"),
+                judgment_by=row_fields.get("judgment_by"),
                 detail_url=absolute,
-                bench=extract_value_after_label(row_text, ["bench", "coram"]),
+                bench=row_fields.get("bench") or extract_value_after_label(row_text, ["bench", "coram"]),
                 citation=extract_value_after_label(row_text, ["citation", "neutral citation"]),
                 reportable_raw=reportable_raw,
             )
@@ -887,6 +1004,49 @@ def extract_first_date(text: str) -> Optional[date]:
     return None
 
 
+def extract_date_from_pdf_url(pdf_url: str) -> Optional[date]:
+    patterns = [
+        r"(\d{2}-[A-Za-z]{3}-\d{4})",
+        r"(\d{4}-\d{2}-\d{2})",
+        r"(\d{2}-\d{2}-\d{4})",
+        r"(\d{2}/\d{2}/\d{4})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, pdf_url)
+        if not m:
+            continue
+        token = m.group(1)
+        try:
+            return parse_date(token)
+        except ValueError:
+            try:
+                return datetime.strptime(token, "%d-%b-%Y").date()
+            except ValueError:
+                continue
+    return None
+
+
+def extract_search_row_fields(row: BeautifulSoup) -> Dict[str, str]:
+    cells = row.find_all("td")
+    values = [normalize_ws(c.get_text(" ", strip=True)) for c in cells]
+    fields: Dict[str, str] = {}
+
+    if len(values) >= 2:
+        fields["diary_number"] = values[1]
+    if len(values) >= 3:
+        fields["case_number"] = values[2]
+    if len(values) >= 4:
+        fields["petitioner_respondent"] = values[3]
+    if len(values) >= 5:
+        fields["petitioner_respondent_advocate"] = values[4]
+    if len(values) >= 6:
+        fields["bench"] = values[5]
+    if len(values) >= 7:
+        fields["judgment_by"] = values[6]
+
+    return {k: v for k, v in fields.items() if v}
+
+
 def infer_reportable_status(row_text: str, link_text: str) -> Optional[str]:
     text = f"{row_text} {link_text}".lower()
     if "non-reportable" in text or "non reportable" in text or re.search(r"\bnr\b", text):
@@ -903,6 +1063,10 @@ def extract_case_title(text: str) -> str:
     if date_match:
         text = text[: date_match.start()].strip(" -|,")
     return text[:200] or "Untitled Case"
+
+
+def normalize_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
 
 
 def build_source_id_from_html(pdf_url: str, case_title: str, judgment_date: date) -> str:
