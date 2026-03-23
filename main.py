@@ -80,6 +80,9 @@ class DownloadState:
         )
         self.conn.commit()
 
+    def close(self) -> None:
+        self.conn.close()
+
     def is_downloaded(self, source_id: str) -> bool:
         row = self.conn.execute(
             "SELECT status, local_path FROM downloads WHERE source_id = ?", (source_id,)
@@ -286,7 +289,7 @@ class SciJudgmentScraper:
 
                 response.raise_for_status()
                 return response
-            except Exception:
+            except requests.RequestException:
                 if attempt > self.args.retries:
                     raise
                 backoff = self.args.min_interval * (2 ** (attempt - 1))
@@ -307,101 +310,104 @@ class SciJudgmentScraper:
         self._session_bootstrapped = True
 
     def run(self) -> None:
-        start_date, end_date = resolve_date_range(self.args)
-        logging.info("Target date range: %s to %s", start_date, end_date)
+        try:
+            start_date, end_date = resolve_date_range(self.args)
+            logging.info("Target date range: %s to %s", start_date, end_date)
 
-        processed = 0
-        downloaded = 0
-        skipped = 0
-        failed = 0
-        pending: List[Tuple[JudgmentRecord, Path]] = []
-        reserved_paths: Set[Path] = set()
-        run_started_at = time.perf_counter()
+            processed = 0
+            downloaded = 0
+            skipped = 0
+            failed = 0
+            pending: List[Tuple[JudgmentRecord, Path]] = []
+            reserved_paths: Set[Path] = set()
+            run_started_at = time.perf_counter()
 
-        for record in self.iter_reportable_records(start_date, end_date):
-            if not self.should_keep_by_reportable_mode(record):
-                skipped += 1
-                continue
-            processed += 1
-            if self.state.is_downloaded(record.source_id):
-                skipped += 1
-                continue
-            pending.append((record, self.build_download_path(record, reserved_paths)))
+            for record in self.iter_reportable_records(start_date, end_date):
+                if not self.should_keep_by_reportable_mode(record):
+                    skipped += 1
+                    continue
+                processed += 1
+                if self.state.is_downloaded(record.source_id):
+                    skipped += 1
+                    continue
+                pending.append((record, self.build_download_path(record, reserved_paths)))
 
-        if pending:
+            if pending:
+                logging.info(
+                    "Prepared %s judgments for download using %s worker(s)",
+                    len(pending),
+                    self.args.download_workers,
+                )
+                self.print_progress(0, len(pending), 0, 0, 0)
+
+            completed_downloads = 0
+            for record, local_path, error, elapsed_seconds in self.download_records_parallel(pending):
+                completed_downloads += 1
+                if error:
+                    failed += 1
+                    self.state.mark_failed(record, error)
+                    self.write_failure(record, error)
+                    logging.error("Failed to download %s: %s", record.source_id, error)
+                    self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
+                    continue
+
+                try:
+                    if self.args.reportable_mode == "reportable" and self.args.reportable_check in {
+                        "pdf",
+                        "metadata_or_pdf",
+                    }:
+                        if not is_pdf_reportable(local_path):
+                            skipped += 1
+                            try:
+                                local_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
+                            continue
+
+                    neutral = extract_neutral_citation_from_pdf(local_path) or record.neutral_citation
+                    if neutral:
+                        record.neutral_citation = neutral
+                        local_path = self.rename_with_neutral_citation(local_path, neutral)
+
+                    self.state.mark_downloaded(record, local_path)
+                    self.write_metadata(record, local_path)
+                    downloaded += 1
+                except Exception as exc:
+                    failed += 1
+                    self.state.mark_failed(record, str(exc))
+                    self.write_failure(record, str(exc))
+                    logging.exception("Failed to finalize %s", record.source_id)
+                finally:
+                    self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
+
+            if pending:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+
+            total_elapsed = time.perf_counter() - run_started_at
+            average_per_pdf = total_elapsed / processed if processed else 0.0
+
             logging.info(
-                "Prepared %s judgments for download using %s worker(s)",
-                len(pending),
-                self.args.download_workers,
+                "Done. processed=%s downloaded=%s skipped=%s failed=%s",
+                processed,
+                downloaded,
+                skipped,
+                failed,
             )
-            self.print_progress(0, len(pending), 0, 0, 0)
-
-        completed_downloads = 0
-        for record, local_path, error, elapsed_seconds in self.download_records_parallel(pending):
-            completed_downloads += 1
-            if error:
-                failed += 1
-                self.state.mark_failed(record, error)
-                self.write_failure(record, error)
-                logging.error("Failed to download %s: %s", record.source_id, error)
-                self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
-                continue
-
-            try:
-                if self.args.reportable_mode == "reportable" and self.args.reportable_check in {
-                    "pdf",
-                    "metadata_or_pdf",
-                }:
-                    if not is_pdf_reportable(local_path):
-                        skipped += 1
-                        try:
-                            local_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
-                        continue
-
-                neutral = extract_neutral_citation_from_pdf(local_path) or record.neutral_citation
-                if neutral:
-                    record.neutral_citation = neutral
-                    local_path = self.rename_with_neutral_citation(local_path, neutral)
-
-                self.state.mark_downloaded(record, local_path)
-                self.write_metadata(record, local_path)
-                downloaded += 1
-            except Exception as exc:
-                failed += 1
-                self.state.mark_failed(record, str(exc))
-                self.write_failure(record, str(exc))
-                logging.exception("Failed to finalize %s", record.source_id)
-            finally:
-                self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
-
-        if pending:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-        total_elapsed = time.perf_counter() - run_started_at
-        average_per_pdf = total_elapsed / processed if processed else 0.0
-
-        logging.info(
-            "Done. processed=%s downloaded=%s skipped=%s failed=%s",
-            processed,
-            downloaded,
-            skipped,
-            failed,
-        )
-        logging.info(
-            "Timing: total=%s average_per_pdf=%s",
-            format_duration(total_elapsed),
-            format_duration(average_per_pdf),
-        )
-        if processed == 0:
-            logging.warning(
-                "No judgment records were discovered for the selected range. "
-                "The current listing page may be JS/API-driven or blocked; "
-                "run with --log-level DEBUG and prefer --api-url from browser Network tab."
+            logging.info(
+                "Timing: total=%s average_per_pdf=%s",
+                format_duration(total_elapsed),
+                format_duration(average_per_pdf),
             )
+            if processed == 0:
+                logging.warning(
+                    "No judgment records were discovered for the selected range. "
+                    "The current listing page may be JS/API-driven or blocked; "
+                    "run with --log-level DEBUG and prefer --api-url from browser Network tab."
+                )
+        finally:
+            self.state.close()
 
     def should_keep_by_reportable_mode(self, record: JudgmentRecord) -> bool:
         if self.args.reportable_mode == "all":
@@ -766,21 +772,21 @@ class SciJudgmentScraper:
         if not self._allowed_by_robots(url):
             raise PermissionError(f"Blocked by robots.txt: {url}")
 
-        session = requests.Session()
-        session.headers.update(self.session.headers)
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                response = session.request("GET", url, timeout=self.args.timeout, **kwargs)
-                if response.status_code in {429, 500, 502, 503, 504}:
-                    raise requests.HTTPError(f"Retryable status code: {response.status_code}")
-                response.raise_for_status()
-                return response
-            except Exception:
-                if attempt > self.args.retries:
-                    raise
-                time.sleep(min(self.args.min_interval, 1.0) * (2 ** (attempt - 1)))
+        with requests.Session() as session:
+            session.headers.update(self.session.headers)
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    response = session.request("GET", url, timeout=self.args.timeout, **kwargs)
+                    if response.status_code in {429, 500, 502, 503, 504}:
+                        raise requests.HTTPError(f"Retryable status code: {response.status_code}")
+                    response.raise_for_status()
+                    return response
+                except requests.RequestException:
+                    if attempt > self.args.retries:
+                        raise
+                    time.sleep(min(self.args.min_interval, 1.0) * (2 ** (attempt - 1)))
 
     def rename_with_neutral_citation(self, file_path: Path, neutral_citation: str) -> Path:
         neutral_token = normalize_neutral_citation_token(neutral_citation)
@@ -961,6 +967,44 @@ def normalize_neutral_citation_token(neutral_citation: str) -> str:
     if not m:
         return ""
     return f"{m.group(1)}_INSC_{m.group(2)}"
+
+
+def extract_pdf_text(pdf_path: Path, max_pages: int = 2) -> str:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(pdf_path))
+    except Exception:
+        return ""
+
+    text_parts: List[str] = []
+    for page in reader.pages[:max_pages]:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if page_text:
+            text_parts.append(page_text)
+    return re.sub(r"\s+", " ", " ".join(text_parts), flags=re.MULTILINE).strip()
+
+
+def is_pdf_reportable(pdf_path: Path) -> bool:
+    text = extract_pdf_text(pdf_path)
+    if not text:
+        return False
+    lower = text.lower()
+
+    # Reject any explicit non-reportable marker, including hyphenated variants.
+    if re.search(r"\bnon\s*[-]?\s*reportable\b", lower):
+        return False
+    return bool(re.search(r"\breportable\b", lower))
+
+
+def extract_neutral_citation_from_pdf(pdf_path: Path) -> Optional[str]:
+    text = extract_pdf_text(pdf_path)
+    if not text:
+        return None
+    return extract_neutral_citation_from_text(text)
 
 
 def format_duration(seconds: float) -> str:
