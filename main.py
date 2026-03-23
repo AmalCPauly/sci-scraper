@@ -314,7 +314,6 @@ class SciJudgmentScraper:
         downloaded = 0
         skipped = 0
         failed = 0
-        downloaded_time_total = 0.0
         pending: List[Tuple[JudgmentRecord, Path]] = []
         reserved_paths: Set[Path] = set()
         run_started_at = time.perf_counter()
@@ -370,7 +369,6 @@ class SciJudgmentScraper:
                 self.state.mark_downloaded(record, local_path)
                 self.write_metadata(record, local_path)
                 downloaded += 1
-                downloaded_time_total += elapsed_seconds
             except Exception as exc:
                 failed += 1
                 self.state.mark_failed(record, str(exc))
@@ -384,7 +382,7 @@ class SciJudgmentScraper:
             sys.stdout.flush()
 
         total_elapsed = time.perf_counter() - run_started_at
-        average_per_pdf = downloaded_time_total / downloaded if downloaded else 0.0
+        average_per_pdf = total_elapsed / processed if processed else 0.0
 
         logging.info(
             "Done. processed=%s downloaded=%s skipped=%s failed=%s",
