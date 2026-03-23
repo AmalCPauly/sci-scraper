@@ -1,15 +1,17 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import hashlib
 import json
 import logging
 import re
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
@@ -312,6 +314,10 @@ class SciJudgmentScraper:
         downloaded = 0
         skipped = 0
         failed = 0
+        downloaded_time_total = 0.0
+        pending: List[Tuple[JudgmentRecord, Path]] = []
+        reserved_paths: Set[Path] = set()
+        run_started_at = time.perf_counter()
 
         for record in self.iter_reportable_records(start_date, end_date):
             if not self.should_keep_by_reportable_mode(record):
@@ -321,10 +327,28 @@ class SciJudgmentScraper:
             if self.state.is_downloaded(record.source_id):
                 skipped += 1
                 continue
+            pending.append((record, self.build_download_path(record, reserved_paths)))
+
+        if pending:
+            logging.info(
+                "Prepared %s judgments for download using %s worker(s)",
+                len(pending),
+                self.args.download_workers,
+            )
+            self.print_progress(0, len(pending), 0, 0, 0)
+
+        completed_downloads = 0
+        for record, local_path, error, elapsed_seconds in self.download_records_parallel(pending):
+            completed_downloads += 1
+            if error:
+                failed += 1
+                self.state.mark_failed(record, error)
+                self.write_failure(record, error)
+                logging.error("Failed to download %s: %s", record.source_id, error)
+                self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
+                continue
 
             try:
-                local_path = self.download_record(record)
-
                 if self.args.reportable_mode == "reportable" and self.args.reportable_check in {
                     "pdf",
                     "metadata_or_pdf",
@@ -335,6 +359,7 @@ class SciJudgmentScraper:
                             local_path.unlink(missing_ok=True)
                         except Exception:
                             pass
+                        self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
                         continue
 
                 neutral = extract_neutral_citation_from_pdf(local_path) or record.neutral_citation
@@ -345,11 +370,21 @@ class SciJudgmentScraper:
                 self.state.mark_downloaded(record, local_path)
                 self.write_metadata(record, local_path)
                 downloaded += 1
+                downloaded_time_total += elapsed_seconds
             except Exception as exc:
                 failed += 1
                 self.state.mark_failed(record, str(exc))
                 self.write_failure(record, str(exc))
-                logging.exception("Failed to download %s", record.source_id)
+                logging.exception("Failed to finalize %s", record.source_id)
+            finally:
+                self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
+
+        if pending:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        total_elapsed = time.perf_counter() - run_started_at
+        average_per_pdf = downloaded_time_total / downloaded if downloaded else 0.0
 
         logging.info(
             "Done. processed=%s downloaded=%s skipped=%s failed=%s",
@@ -357,6 +392,11 @@ class SciJudgmentScraper:
             downloaded,
             skipped,
             failed,
+        )
+        logging.info(
+            "Timing: total=%s average_per_pdf=%s",
+            format_duration(total_elapsed),
+            format_duration(average_per_pdf),
         )
         if processed == 0:
             logging.warning(
@@ -652,20 +692,28 @@ class SciJudgmentScraper:
             all_records.extend(parse_html_candidates(soup, self.args.index_url))
         return all_records
 
-    def download_record(self, record: JudgmentRecord) -> Path:
+    def build_download_path(self, record: JudgmentRecord, reserved_paths: Optional[Set[Path]] = None) -> Path:
         target_dir = self.output_dir / str(record.judgment_date.year) / f"{record.judgment_date.month:02d}"
         target_dir.mkdir(parents=True, exist_ok=True)
 
         case_title_for_file = record.petitioner_respondent or record.case_title
         safe_title = format_case_title_for_filename(case_title_for_file)
         filename = f"{record.judgment_date.strftime('%Y-%m-%d')}-{safe_title}.pdf"
-        file_path = dedupe_path(target_dir / filename)
+        file_path = dedupe_path(target_dir / filename, reserved_paths)
+        if reserved_paths is not None:
+            reserved_paths.add(file_path)
+        return file_path
+
+    def download_record(self, record: JudgmentRecord, file_path: Optional[Path] = None) -> Tuple[Path, float]:
+        if file_path is None:
+            file_path = self.build_download_path(record)
+        started_at = time.perf_counter()
 
         if self.args.dry_run:
             logging.info("[DRY RUN] %s -> %s", record.pdf_url, file_path)
-            return file_path
+            return file_path, 0.0
 
-        response = self._request("GET", record.pdf_url, stream=True)
+        response = self._download_request(record.pdf_url, stream=True)
         content_type = (response.headers.get("Content-Type") or "").lower()
         if "pdf" not in content_type and not record.pdf_url.lower().endswith(".pdf"):
             raise ValueError(f"Not a PDF response: {record.pdf_url} ({content_type})")
@@ -674,7 +722,67 @@ class SciJudgmentScraper:
             for chunk in response.iter_content(chunk_size=1024 * 64):
                 if chunk:
                     f.write(chunk)
-        return file_path
+        return file_path, time.perf_counter() - started_at
+
+    def download_records_parallel(
+        self, pending: List[Tuple[JudgmentRecord, Path]]
+    ) -> Iterator[Tuple[JudgmentRecord, Path, Optional[str], float]]:
+        if not pending:
+            return
+        if self.args.dry_run or self.args.download_workers <= 1:
+            for record, file_path in pending:
+                try:
+                    downloaded_path, elapsed_seconds = self.download_record(record, file_path)
+                    yield record, downloaded_path, None, elapsed_seconds
+                except Exception as exc:
+                    yield record, file_path, str(exc), 0.0
+            return
+
+        with ThreadPoolExecutor(max_workers=self.args.download_workers) as executor:
+            future_map = {
+                executor.submit(self.download_record, record, file_path): (record, file_path)
+                for record, file_path in pending
+            }
+            for future in as_completed(future_map):
+                record, file_path = future_map[future]
+                try:
+                    downloaded_path, elapsed_seconds = future.result()
+                    yield record, downloaded_path, None, elapsed_seconds
+                except Exception as exc:
+                    yield record, file_path, str(exc), 0.0
+
+    def print_progress(self, completed: int, total: int, downloaded: int, skipped: int, failed: int) -> None:
+        if total <= 0:
+            return
+        bar_width = 28
+        filled = int((completed / total) * bar_width)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        message = (
+            f"\rDownloading [{bar}] {completed}/{total} "
+            f"(downloaded={downloaded} skipped={skipped} failed={failed})"
+        )
+        sys.stdout.write(message)
+        sys.stdout.flush()
+
+    def _download_request(self, url: str, **kwargs) -> requests.Response:
+        if not self._allowed_by_robots(url):
+            raise PermissionError(f"Blocked by robots.txt: {url}")
+
+        session = requests.Session()
+        session.headers.update(self.session.headers)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = session.request("GET", url, timeout=self.args.timeout, **kwargs)
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    raise requests.HTTPError(f"Retryable status code: {response.status_code}")
+                response.raise_for_status()
+                return response
+            except Exception:
+                if attempt > self.args.retries:
+                    raise
+                time.sleep(min(self.args.min_interval, 1.0) * (2 ** (attempt - 1)))
 
     def rename_with_neutral_citation(self, file_path: Path, neutral_citation: str) -> Path:
         neutral_token = normalize_neutral_citation_token(neutral_citation)
@@ -767,15 +875,15 @@ def format_case_title_for_filename(value: str) -> str:
     return text[:180] or "Untitled_Case"
 
 
-def dedupe_path(path: Path) -> Path:
-    if not path.exists():
+def dedupe_path(path: Path, reserved_paths: Optional[Set[Path]] = None) -> Path:
+    if not path.exists() and (reserved_paths is None or path not in reserved_paths):
         return path
     stem = path.stem
     suffix = path.suffix
     parent = path.parent
     for i in range(2, 10000):
         candidate = parent / f"{stem}_{i}{suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and (reserved_paths is None or candidate not in reserved_paths):
             return candidate
     raise RuntimeError(f"Could not generate unique file name for {path}")
 
@@ -855,6 +963,18 @@ def normalize_neutral_citation_token(neutral_citation: str) -> str:
     if not m:
         return ""
     return f"{m.group(1)}_INSC_{m.group(2)}"
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds:.2f}s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rem = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {rem:.1f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {rem:.1f}s"
 
 
 def build_url_with_query(url: str, params: Dict[str, object]) -> str:
@@ -1371,6 +1491,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="downloads", help="Root output folder")
     parser.add_argument("--dry-run", action="store_true", help="Discover and log without downloading PDFs")
     parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers used for PDF downloads.",
+    )
+    parser.add_argument(
         "--reportable-mode",
         default="reportable",
         choices=["reportable", "all"],
@@ -1432,6 +1558,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.download_workers < 1:
+        parser.error("--download-workers must be at least 1")
     configure_logging(args.log_level)
 
     try:
