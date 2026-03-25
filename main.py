@@ -1639,7 +1639,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--download-workers",
         type=int,
-        default=4,
+        default=16,
         help="Number of parallel workers used for PDF downloads.",
     )
     parser.add_argument(

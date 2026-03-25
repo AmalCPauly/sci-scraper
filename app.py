@@ -112,7 +112,7 @@ def ensure_state() -> None:
     state.setdefault("year_value", date.today().year)
     state.setdefault("from_date_value", date.today().replace(day=1))
     state.setdefault("to_date_value", date.today())
-    state.setdefault("download_workers", 12)
+    state.setdefault("download_workers", 16)
     state.setdefault("reportable_mode", "reportable")
     state.setdefault("reportable_check", "pdf")
     state.setdefault("log_level", "INFO")
@@ -303,8 +303,8 @@ def render_sidebar() -> None:
         st.session_state.download_workers = st.sidebar.slider(
             "Parallel download workers",
             min_value=1,
-            max_value=12,
-            value=int(st.session_state.get("download_workers", 12)),
+            max_value=20,
+            value=int(st.session_state.get("download_workers", 16)),
             disabled=st.session_state.run_active,
         )
         st.session_state.reportable_mode = st.sidebar.selectbox(
