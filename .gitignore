@@ -6,3 +6,5 @@ downloads*
 *.html
 *.js
 ajax-response.json
+build/
+dist/

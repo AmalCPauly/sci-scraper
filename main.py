@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
@@ -55,6 +55,16 @@ class CaseRef:
     diary_no: str
     diary_year: str
     tab_name: str
+
+
+@dataclass
+class RunSummary:
+    processed: int
+    downloaded: int
+    skipped: int
+    failed: int
+    total_elapsed_seconds: float
+    average_per_processed_seconds: float
 
 
 class DownloadState:
@@ -168,8 +178,18 @@ class DownloadState:
 
 
 class SciJudgmentScraper:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *,
+        captcha_provider: Optional[Callable[[Path, str], str]] = None,
+        progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+        enable_terminal_progress: bool = True,
+    ) -> None:
         self.args = args
+        self.captcha_provider = captcha_provider
+        self.progress_callback = progress_callback
+        self.enable_terminal_progress = enable_terminal_progress
         self.output_dir = Path(args.output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -309,7 +329,7 @@ class SciJudgmentScraper:
                 logging.debug("Bootstrap request failed for %s: %s", target, exc)
         self._session_bootstrapped = True
 
-    def run(self) -> None:
+    def run(self) -> RunSummary:
         try:
             start_date, end_date = resolve_date_range(self.args)
             logging.info("Target date range: %s to %s", start_date, end_date)
@@ -331,6 +351,9 @@ class SciJudgmentScraper:
                     skipped += 1
                     continue
                 pending.append((record, self.build_download_path(record, reserved_paths)))
+
+            if pending:
+                self.ensure_pdf_runtime_ready()
 
             if pending:
                 logging.info(
@@ -388,6 +411,14 @@ class SciJudgmentScraper:
             total_elapsed = time.perf_counter() - run_started_at
             average_per_pdf = total_elapsed / processed if processed else 0.0
 
+            summary = RunSummary(
+                processed=processed,
+                downloaded=downloaded,
+                skipped=skipped,
+                failed=failed,
+                total_elapsed_seconds=total_elapsed,
+                average_per_processed_seconds=average_per_pdf,
+            )
             logging.info(
                 "Done. processed=%s downloaded=%s skipped=%s failed=%s",
                 processed,
@@ -400,14 +431,35 @@ class SciJudgmentScraper:
                 format_duration(total_elapsed),
                 format_duration(average_per_pdf),
             )
+            if self.progress_callback is not None:
+                self.progress_callback(
+                    {
+                        "event": "summary",
+                        "processed": processed,
+                        "downloaded": downloaded,
+                        "skipped": skipped,
+                        "failed": failed,
+                        "total_elapsed_seconds": total_elapsed,
+                        "average_per_processed_seconds": average_per_pdf,
+                    }
+                )
             if processed == 0:
                 logging.warning(
                     "No judgment records were discovered for the selected range. "
                     "The current listing page may be JS/API-driven or blocked; "
                     "run with --log-level DEBUG and prefer --api-url from browser Network tab."
                 )
+            return summary
         finally:
             self.state.close()
+
+    def ensure_pdf_runtime_ready(self) -> None:
+        if self.args.reportable_mode == "reportable" and self.args.reportable_check in {
+            "pdf",
+            "metadata_or_pdf",
+        }:
+            ensure_pypdf_available()
+        ensure_pypdf_available()
 
     def should_keep_by_reportable_mode(self, record: JudgmentRecord) -> bool:
         if self.args.reportable_mode == "all":
@@ -593,19 +645,11 @@ class SciJudgmentScraper:
                         f.write(chunk)
 
             logging.info("Solve CAPTCHA image: %s", captcha_path)
-            if not self.args.interactive_captcha:
-                raise RuntimeError(
-                    "CAPTCHA requires user input. Run with interactive terminal or enable --interactive-captcha."
-                )
-
             prompt = (
                 f"Enter CAPTCHA for {chunk_start.isoformat()}..{chunk_end.isoformat()} "
                 "(or 'r' to refresh, 'q' to abort): "
             )
-            try:
-                entered = input(prompt).strip()
-            except EOFError as exc:
-                raise RuntimeError("No stdin available for CAPTCHA input") from exc
+            entered = self.request_captcha_input(captcha_path, prompt)
 
             if entered.lower() == "q":
                 raise KeyboardInterrupt("User aborted during CAPTCHA entry")
@@ -637,6 +681,18 @@ class SciJudgmentScraper:
 
         logging.warning("Exceeded CAPTCHA attempts for %s to %s", chunk_start, chunk_end)
         return None, {}
+
+    def request_captcha_input(self, captcha_path: Path, prompt: str) -> str:
+        if self.captcha_provider is not None:
+            return self.captcha_provider(captcha_path, prompt).strip()
+        if not self.args.interactive_captcha:
+            raise RuntimeError(
+                "CAPTCHA requires user input. Run with interactive terminal or enable --interactive-captcha."
+            )
+        try:
+            return input(prompt).strip()
+        except EOFError as exc:
+            raise RuntimeError("No stdin available for CAPTCHA input") from exc
 
     def _fetch_captcha_pagination_page(
         self,
@@ -756,7 +812,20 @@ class SciJudgmentScraper:
                     yield record, file_path, str(exc), 0.0
 
     def print_progress(self, completed: int, total: int, downloaded: int, skipped: int, failed: int) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(
+                {
+                    "event": "progress",
+                    "completed": completed,
+                    "total": total,
+                    "downloaded": downloaded,
+                    "skipped": skipped,
+                    "failed": failed,
+                }
+            )
         if total <= 0:
+            return
+        if not self.enable_terminal_progress:
             return
         bar_width = 28
         filled = int((completed / total) * bar_width)
@@ -969,7 +1038,18 @@ def normalize_neutral_citation_token(neutral_citation: str) -> str:
     return f"{m.group(1)}_INSC_{m.group(2)}"
 
 
+def ensure_pypdf_available() -> None:
+    try:
+        import pypdf  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Missing dependency 'pypdf'. Install packages from requirements.txt in the same Python "
+            "environment used to run this app."
+        ) from exc
+
+
 def extract_pdf_text(pdf_path: Path, max_pages: int = 2) -> str:
+    ensure_pypdf_available()
     try:
         from pypdf import PdfReader
 
