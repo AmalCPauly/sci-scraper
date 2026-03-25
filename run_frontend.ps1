@@ -11,4 +11,4 @@ if (-not (Test-Path $appPath)) {
   throw "Streamlit app not found at $appPath"
 }
 
-& $venvPython -m streamlit run $appPath --server.headless=true --browser.gatherUsageStats=false
+& $venvPython -m streamlit run $appPath --global.developmentMode=false --server.address=127.0.0.1 --server.port=8501 --server.headless=false --browser.gatherUsageStats=false

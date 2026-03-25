@@ -405,8 +405,7 @@ class SciJudgmentScraper:
                     self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
 
             if pending:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+                self.safe_stdout_write("\n")
 
             total_elapsed = time.perf_counter() - run_started_at
             average_per_pdf = total_elapsed / processed if processed else 0.0
@@ -649,7 +648,10 @@ class SciJudgmentScraper:
                 f"Enter CAPTCHA for {chunk_start.isoformat()}..{chunk_end.isoformat()} "
                 "(or 'r' to refresh, 'q' to abort): "
             )
-            entered = self.request_captcha_input(captcha_path, prompt)
+            try:
+                entered = self.request_captcha_input(captcha_path, prompt)
+            finally:
+                self.cleanup_captcha_image(captcha_path, captcha_dir)
 
             if entered.lower() == "q":
                 raise KeyboardInterrupt("User aborted during CAPTCHA entry")
@@ -681,6 +683,19 @@ class SciJudgmentScraper:
 
         logging.warning("Exceeded CAPTCHA attempts for %s to %s", chunk_start, chunk_end)
         return None, {}
+
+    def cleanup_captcha_image(self, captcha_path: Path, captcha_dir: Path) -> None:
+        try:
+            captcha_path.unlink(missing_ok=True)
+        except Exception:
+            return
+        try:
+            next(captcha_dir.iterdir())
+        except StopIteration:
+            try:
+                captcha_dir.rmdir()
+            except Exception:
+                pass
 
     def request_captcha_input(self, captcha_path: Path, prompt: str) -> str:
         if self.captcha_provider is not None:
@@ -834,8 +849,17 @@ class SciJudgmentScraper:
             f"\rDownloading [{bar}] {completed}/{total} "
             f"(downloaded={downloaded} skipped={skipped} failed={failed})"
         )
-        sys.stdout.write(message)
-        sys.stdout.flush()
+        self.safe_stdout_write(message)
+
+    def safe_stdout_write(self, message: str) -> None:
+        stdout = getattr(sys, "stdout", None)
+        if stdout is None:
+            return
+        try:
+            stdout.write(message)
+            stdout.flush()
+        except Exception:
+            pass
 
     def _download_request(self, url: str, **kwargs) -> requests.Response:
         if not self._allowed_by_robots(url):

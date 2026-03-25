@@ -13,6 +13,9 @@ if (-not (Test-Path $venvPython)) {
   --name $appName `
   --noconsole `
   --add-data "app.py;." `
+  --add-data "main.py;." `
+  --hidden-import urllib.robotparser `
+  --collect-all pypdf `
   --collect-all streamlit `
   launch_frontend.py
 

@@ -14,4 +14,4 @@ if not exist "%APP_PATH%" (
   exit /b 1
 )
 
-"%VENV_PYTHON%" -m streamlit run "%APP_PATH%" --server.headless=true --browser.gatherUsageStats=false
+"%VENV_PYTHON%" -m streamlit run "%APP_PATH%" --global.developmentMode=false --server.address=127.0.0.1 --server.port=8501 --server.headless=false --browser.gatherUsageStats=false

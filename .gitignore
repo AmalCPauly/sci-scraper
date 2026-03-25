@@ -8,3 +8,5 @@ downloads*
 ajax-response.json
 build/
 dist/
+installer-output/
+prereqs/

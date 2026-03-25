@@ -1,7 +1,8 @@
 import logging
+import os
 import threading
 import time
-from datetime import date, datetime
+from datetime import date
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
 
@@ -102,15 +103,16 @@ def ensure_state() -> None:
     state.setdefault("summary", None)
     state.setdefault("run_active", False)
     state.setdefault("error_message", "")
-    state.setdefault("output_dir", "downloads_ui")
-    state.setdefault("active_output_dir", "downloads_ui")
-    state.setdefault("use_fresh_output_folder", True)
+    state.setdefault("output_dir", "downloads")
+    state.setdefault("active_output_dir", "downloads")
     state.setdefault("date_mode", "Month")
-    state.setdefault("month_value", "2025-11")
+    state.setdefault("ui_mode", "Simple")
+    state.setdefault("month_year_value", date.today().year)
+    state.setdefault("month_number_value", date.today().month)
     state.setdefault("year_value", date.today().year)
     state.setdefault("from_date_value", date.today().replace(day=1))
     state.setdefault("to_date_value", date.today())
-    state.setdefault("download_workers", 4)
+    state.setdefault("download_workers", 12)
     state.setdefault("reportable_mode", "reportable")
     state.setdefault("reportable_check", "pdf")
     state.setdefault("log_level", "INFO")
@@ -137,7 +139,7 @@ def build_ui_args() -> Any:
     if mode == "Year":
         args.year = int(st.session_state.year_value)
     elif mode == "Month":
-        args.month = st.session_state.month_value
+        args.month = f"{int(st.session_state.month_year_value)}-{int(st.session_state.month_number_value):02d}"
     else:
         args.from_date = st.session_state.from_date_value.strftime("%Y-%m-%d")
         args.to_date = st.session_state.to_date_value.strftime("%Y-%m-%d")
@@ -145,11 +147,31 @@ def build_ui_args() -> Any:
 
 
 def resolve_run_output_dir() -> str:
-    base_dir = st.session_state.output_dir.strip() or "downloads_ui"
-    if not st.session_state.use_fresh_output_folder:
-        return base_dir
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{base_dir}_{timestamp}"
+    return st.session_state.output_dir.strip() or "downloads"
+
+
+def pick_output_folder(initial_dir: str) -> Optional[str]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(
+            title="Select output folder",
+            initialdir=initial_dir if initial_dir else os.getcwd(),
+        )
+        root.destroy()
+    except Exception:
+        return None
+
+    if selected:
+        return selected
+    return None
 
 
 def drain_events() -> None:
@@ -193,25 +215,65 @@ def drain_events() -> None:
 
 def render_sidebar() -> None:
     st.sidebar.header("Run Options")
+    st.session_state.ui_mode = st.sidebar.toggle(
+        "Advanced mode",
+        value=st.session_state.get("ui_mode", "Simple") == "Advanced",
+        disabled=st.session_state.run_active,
+    )
+    if st.session_state.ui_mode:
+        st.session_state.ui_mode = "Advanced"
+    else:
+        st.session_state.ui_mode = "Simple"
+
     st.session_state.date_mode = st.sidebar.radio(
         "Date filter",
         ["Month", "Year", "Custom Range"],
         index=["Month", "Year", "Custom Range"].index(st.session_state.get("date_mode", "Month")),
         disabled=st.session_state.run_active,
     )
+    year_options = list(range(1950, 2101))
     if st.session_state.date_mode == "Month":
-        st.session_state.month_value = st.sidebar.text_input(
-            "Month (YYYY-MM)",
-            value=st.session_state.get("month_value", "2025-11"),
+        selected_month_year = int(st.session_state.get("month_year_value", date.today().year))
+        if selected_month_year not in year_options:
+            selected_month_year = date.today().year
+        st.session_state.month_year_value = st.sidebar.selectbox(
+            "Year",
+            options=year_options,
+            index=year_options.index(selected_month_year),
             disabled=st.session_state.run_active,
         )
+        month_labels = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ]
+        selected_month_number = int(st.session_state.get("month_number_value", date.today().month))
+        if selected_month_number < 1 or selected_month_number > 12:
+            selected_month_number = date.today().month
+        selected_month_label = st.sidebar.selectbox(
+            "Month",
+            options=month_labels,
+            index=selected_month_number - 1,
+            disabled=st.session_state.run_active,
+        )
+        st.session_state.month_number_value = month_labels.index(selected_month_label) + 1
     elif st.session_state.date_mode == "Year":
-        st.session_state.year_value = st.sidebar.number_input(
+        selected_year = int(st.session_state.get("year_value", date.today().year))
+        if selected_year not in year_options:
+            selected_year = date.today().year
+        st.session_state.year_value = st.sidebar.selectbox(
             "Year",
-            min_value=1950,
-            max_value=2100,
-            value=int(st.session_state.get("year_value", 2025)),
-            step=1,
+            options=year_options,
+            index=year_options.index(selected_year),
             disabled=st.session_state.run_active,
         )
     else:
@@ -226,48 +288,45 @@ def render_sidebar() -> None:
             disabled=st.session_state.run_active,
         )
 
-    st.session_state.output_dir = st.sidebar.text_input(
-        "Base output folder",
-        value=st.session_state.get("output_dir", "downloads_ui"),
-        disabled=st.session_state.run_active,
-    )
-    st.session_state.use_fresh_output_folder = st.sidebar.checkbox(
-        "Use a fresh folder for each run",
-        value=bool(st.session_state.get("use_fresh_output_folder", True)),
-        disabled=st.session_state.run_active,
-    )
-    final_output_dir = resolve_run_output_dir()
-    st.sidebar.caption(
-        f"Run output folder: `{final_output_dir}`\n\n"
-        "If you reuse an existing folder, already-downloaded files will be skipped."
-    )
-    st.session_state.download_workers = st.sidebar.slider(
-        "Parallel download workers",
-        min_value=1,
-        max_value=12,
-        value=int(st.session_state.get("download_workers", 4)),
-        disabled=st.session_state.run_active,
-    )
-    st.session_state.reportable_mode = st.sidebar.selectbox(
-        "Download mode",
-        ["reportable", "all"],
-        index=["reportable", "all"].index(st.session_state.get("reportable_mode", "reportable")),
-        disabled=st.session_state.run_active,
-    )
-    st.session_state.reportable_check = st.sidebar.selectbox(
-        "Reportable check",
-        ["pdf", "metadata_or_pdf", "metadata"],
-        index=["pdf", "metadata_or_pdf", "metadata"].index(
-            st.session_state.get("reportable_check", "pdf")
-        ),
-        disabled=st.session_state.run_active,
-    )
-    st.session_state.log_level = st.sidebar.selectbox(
-        "Log level",
-        ["INFO", "DEBUG", "WARNING", "ERROR"],
-        index=["INFO", "DEBUG", "WARNING", "ERROR"].index(st.session_state.get("log_level", "INFO")),
-        disabled=st.session_state.run_active,
-    )
+    st.sidebar.caption(f"Output folder: `{st.session_state.get('output_dir', 'downloads')}`")
+    browse_disabled = st.session_state.run_active
+    if st.sidebar.button("Browse output folder", disabled=browse_disabled):
+        current = st.session_state.get("output_dir", "downloads")
+        selected = pick_output_folder(current)
+        if selected:
+            st.session_state.output_dir = selected
+            st.rerun()
+        else:
+            st.sidebar.warning("Folder picker is unavailable on this system.")
+    st.sidebar.caption("Already-downloaded files in this folder will be skipped.")
+    if st.session_state.ui_mode == "Advanced":
+        st.session_state.download_workers = st.sidebar.slider(
+            "Parallel download workers",
+            min_value=1,
+            max_value=12,
+            value=int(st.session_state.get("download_workers", 12)),
+            disabled=st.session_state.run_active,
+        )
+        st.session_state.reportable_mode = st.sidebar.selectbox(
+            "Download mode",
+            ["reportable", "all"],
+            index=["reportable", "all"].index(st.session_state.get("reportable_mode", "reportable")),
+            disabled=st.session_state.run_active,
+        )
+        st.session_state.reportable_check = st.sidebar.selectbox(
+            "Reportable check",
+            ["pdf", "metadata_or_pdf", "metadata"],
+            index=["pdf", "metadata_or_pdf", "metadata"].index(
+                st.session_state.get("reportable_check", "pdf")
+            ),
+            disabled=st.session_state.run_active,
+        )
+        st.session_state.log_level = st.sidebar.selectbox(
+            "Log level",
+            ["INFO", "DEBUG", "WARNING", "ERROR"],
+            index=["INFO", "DEBUG", "WARNING", "ERROR"].index(st.session_state.get("log_level", "INFO")),
+            disabled=st.session_state.run_active,
+        )
 
     if st.sidebar.button("Start Download", disabled=st.session_state.run_active):
         bridge = FrontendRunBridge()
@@ -280,6 +339,16 @@ def render_sidebar() -> None:
         st.session_state.run_active = True
         bridge.start(build_ui_args())
         st.rerun()
+
+    if st.sidebar.button("Stop and Exit"):
+        bridge = st.session_state.get("bridge")
+        if bridge is not None:
+            try:
+                bridge.submit_answer("q")
+            except Exception:
+                pass
+        # Terminate the Streamlit process (and packaged EXE) immediately.
+        os._exit(0)
 
 
 def render_status() -> None:
@@ -376,7 +445,8 @@ def main() -> None:
     render_captcha()
     render_status()
     render_outputs()
-    render_logs()
+    if st.session_state.ui_mode == "Advanced":
+        render_logs()
 
     if st.session_state.run_active and st.session_state.captcha is None:
         time.sleep(1)
