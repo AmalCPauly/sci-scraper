@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 from main import SciJudgmentScraper, build_arg_parser, format_duration
 
@@ -134,6 +135,7 @@ def ensure_state() -> None:
     state.setdefault("startup_checks_at", 0.0)
     state.setdefault("startup_checks_target", "")
     state.setdefault("startup_blocking_error", "")
+    state.setdefault("captcha_seq", 0)
 
 
 def build_ui_args() -> Any:
@@ -336,6 +338,7 @@ def drain_events() -> None:
             elif payload.get("event") == "summary":
                 st.session_state.summary = payload
         elif event["type"] == "captcha":
+            st.session_state.captcha_seq = int(st.session_state.get("captcha_seq", 0)) + 1
             st.session_state.captcha = event
         elif event["type"] == "complete":
             st.session_state.summary = {
@@ -567,18 +570,37 @@ def render_captcha() -> None:
     st.subheader("CAPTCHA Required")
     st.write(challenge["prompt"])
     st.image(challenge["path"], caption="Solve this CAPTCHA to continue", use_container_width=False)
-
-    answer = st.text_input("CAPTCHA answer", key="captcha_answer")
-    col1, col2, col3 = st.columns(3)
-    if col1.button("Submit CAPTCHA"):
+    captcha_input_key = f"captcha_answer_{int(st.session_state.get('captcha_seq', 0))}"
+    with st.form(key=f"captcha_form_{int(st.session_state.get('captcha_seq', 0))}"):
+        answer = st.text_input("CAPTCHA answer", key=captcha_input_key)
+        submitted = st.form_submit_button("Submit CAPTCHA")
+    if submitted:
         st.session_state.bridge.submit_answer(answer)
         st.session_state.captcha = None
         st.rerun()
-    if col2.button("Refresh CAPTCHA"):
+
+    # Best-effort autofocus for the CAPTCHA field on each new challenge.
+    components.html(
+        """
+        <script>
+          const focusCaptcha = () => {
+            const root = window.parent?.document || document;
+            const input = root.querySelector('input[aria-label="CAPTCHA answer"]');
+            if (input) { input.focus(); input.select(); }
+          };
+          setTimeout(focusCaptcha, 0);
+          setTimeout(focusCaptcha, 150);
+        </script>
+        """,
+        height=0,
+    )
+
+    col1, col2 = st.columns(2)
+    if col1.button("Refresh CAPTCHA"):
         st.session_state.bridge.submit_answer("r")
         st.session_state.captcha = None
         st.rerun()
-    if col3.button("Abort Run"):
+    if col2.button("Abort Run"):
         st.session_state.bridge.submit_answer("q")
         st.session_state.captcha = None
         st.session_state.run_active = False
