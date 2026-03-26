@@ -318,10 +318,11 @@ def pick_output_folder(initial_dir: str) -> Optional[str]:
     return None
 
 
-def drain_events() -> None:
+def drain_events() -> bool:
     bridge = st.session_state.bridge
     if bridge is None:
-        return
+        return False
+    needs_full_rerun = False
 
     while True:
         try:
@@ -359,11 +360,14 @@ def drain_events() -> None:
             st.session_state.run_active = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            needs_full_rerun = True
         elif event["type"] == "error":
             st.session_state.error_message = event["message"]
             st.session_state.run_active = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            needs_full_rerun = True
+    return needs_full_rerun
 
 
 def render_sidebar() -> None:
@@ -652,7 +656,8 @@ def render_logs() -> None:
 
 @st.fragment(run_every="1s")
 def render_live_sections() -> None:
-    drain_events()
+    if drain_events():
+        st.rerun()
     render_captcha()
     render_status()
     render_outputs()
