@@ -1,20 +1,25 @@
 import logging
 import os
+import platform
 import threading
 import time
 from datetime import date
+from importlib.util import find_spec
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
 
+import requests
 import streamlit as st
 
 from main import SciJudgmentScraper, build_arg_parser, format_duration
 
 AUTO_EXIT_GRACE_SECONDS = 90
+STARTUP_CHECK_CACHE_SECONDS = 30
 _HEARTBEAT_LOCK = threading.Lock()
 _LAST_HEARTBEAT = time.monotonic()
 _WATCHDOG_STARTED = False
+_AUTO_EXIT_ALLOWED = False
 
 
 class QueueLogHandler(logging.Handler):
@@ -113,6 +118,12 @@ def touch_heartbeat() -> None:
         _LAST_HEARTBEAT = time.monotonic()
 
 
+def set_auto_exit_allowed(allowed: bool) -> None:
+    global _AUTO_EXIT_ALLOWED
+    with _HEARTBEAT_LOCK:
+        _AUTO_EXIT_ALLOWED = allowed
+
+
 def ensure_watchdog_started() -> None:
     global _WATCHDOG_STARTED
     if _WATCHDOG_STARTED:
@@ -123,7 +134,8 @@ def ensure_watchdog_started() -> None:
             time.sleep(3)
             with _HEARTBEAT_LOCK:
                 idle_for = time.monotonic() - _LAST_HEARTBEAT
-            if idle_for > AUTO_EXIT_GRACE_SECONDS:
+                auto_exit_allowed = _AUTO_EXIT_ALLOWED
+            if auto_exit_allowed and idle_for > AUTO_EXIT_GRACE_SECONDS:
                 os._exit(0)
 
     thread = threading.Thread(target=watchdog_loop, daemon=True)
@@ -155,6 +167,11 @@ def ensure_state() -> None:
     state.setdefault("reportable_mode", "reportable")
     state.setdefault("reportable_check", "pdf")
     state.setdefault("log_level", "INFO")
+    state.setdefault("has_started_run", False)
+    state.setdefault("startup_checks", None)
+    state.setdefault("startup_checks_at", 0.0)
+    state.setdefault("startup_checks_target", "")
+    state.setdefault("startup_blocking_error", "")
 
 
 def build_ui_args() -> Any:
@@ -188,6 +205,128 @@ def build_ui_args() -> Any:
 def resolve_run_output_dir() -> str:
     chosen = st.session_state.output_dir.strip() or default_output_dir()
     return str(Path(chosen))
+
+
+def check_output_folder_writable(path_str: str) -> Dict[str, str]:
+    try:
+        folder = Path(path_str).resolve()
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".write_test.tmp"
+        with probe.open("w", encoding="utf-8") as f:
+            f.write("ok")
+        probe.unlink(missing_ok=True)
+        return {
+            "name": "Writable output folder",
+            "status": "pass",
+            "message": str(folder),
+        }
+    except Exception as exc:
+        return {
+            "name": "Writable output folder",
+            "status": "fail",
+            "message": f"{path_str} ({exc})",
+        }
+
+
+def check_sci_network_ssl() -> Dict[str, str]:
+    url = "https://www.sci.gov.in/"
+    try:
+        response = requests.get(url, timeout=8)
+        response.raise_for_status()
+        return {
+            "name": "Network/SSL to sci.gov.in",
+            "status": "pass",
+            "message": f"{url} -> {response.status_code}",
+        }
+    except requests.exceptions.SSLError as exc:
+        return {
+            "name": "Network/SSL to sci.gov.in",
+            "status": "fail",
+            "message": f"SSL certificate verification failed ({exc})",
+        }
+    except Exception as exc:
+        return {
+            "name": "Network/SSL to sci.gov.in",
+            "status": "fail",
+            "message": str(exc),
+        }
+
+
+def check_dependencies_and_runtime() -> Dict[str, Any]:
+    dependencies = [
+        "requests",
+        "bs4",
+        "pypdf",
+        "sqlite3",
+        "tkinter",
+    ]
+    missing = [name for name in dependencies if find_spec(name) is None]
+    runtime_notes = [
+        f"Python {platform.python_version()} ({platform.architecture()[0]})",
+        f"Streamlit {st.__version__}",
+    ]
+    if missing:
+        return {
+            "item": {
+                "name": "Dependency/runtime summary",
+                "status": "fail",
+                "message": f"Missing modules: {', '.join(missing)}",
+            },
+            "notes": runtime_notes,
+        }
+    return {
+        "item": {
+            "name": "Dependency/runtime summary",
+            "status": "pass",
+            "message": "All required modules are available",
+        },
+        "notes": runtime_notes,
+    }
+
+
+def run_startup_checks(force: bool = False) -> None:
+    now = time.monotonic()
+    target = resolve_run_output_dir()
+    last_target = st.session_state.get("startup_checks_target", "")
+    last_at = float(st.session_state.get("startup_checks_at", 0.0))
+    if not force and last_target == target and (now - last_at) < STARTUP_CHECK_CACHE_SECONDS:
+        return
+
+    output_item = check_output_folder_writable(target)
+    network_item = check_sci_network_ssl()
+    dep_result = check_dependencies_and_runtime()
+    items = [output_item, network_item, dep_result["item"]]
+
+    blocking_failures = [item["name"] for item in items if item["status"] == "fail"]
+    st.session_state.startup_checks = {
+        "items": items,
+        "runtime_notes": dep_result["notes"],
+        "blocking_failures": blocking_failures,
+    }
+    st.session_state.startup_checks_at = now
+    st.session_state.startup_checks_target = target
+    if blocking_failures:
+        st.session_state.startup_blocking_error = "; ".join(blocking_failures)
+    else:
+        st.session_state.startup_blocking_error = ""
+
+
+def render_startup_checks() -> None:
+    checks = st.session_state.get("startup_checks")
+    if not checks:
+        return
+    if not checks["blocking_failures"]:
+        return
+    if st.session_state.get("has_started_run", False):
+        return
+
+    st.error(
+        "App setup checks failed. Please fix the issue below before starting download:\n\n"
+        + "\n".join(f"- {name}" for name in checks["blocking_failures"])
+    )
+    if st.button("Retry checks"):
+        run_startup_checks(force=True)
+        st.rerun()
 
 
 def pick_output_folder(initial_dir: str) -> Optional[str]:
@@ -395,9 +534,13 @@ def render_sidebar() -> None:
     if validation_error:
         st.sidebar.error(validation_error)
 
+    startup_blocked = bool(st.session_state.get("startup_blocking_error")) and not st.session_state.get(
+        "has_started_run", False
+    )
+
     if st.sidebar.button(
         "Start Download",
-        disabled=st.session_state.run_active or bool(validation_error),
+        disabled=st.session_state.run_active or bool(validation_error) or startup_blocked,
     ):
         bridge = FrontendRunBridge()
         st.session_state.bridge = bridge
@@ -407,6 +550,7 @@ def render_sidebar() -> None:
         st.session_state.captcha = None
         st.session_state.error_message = ""
         st.session_state.run_active = True
+        st.session_state.has_started_run = True
         bridge.start(build_ui_args())
         st.rerun()
 
@@ -506,10 +650,17 @@ def render_logs() -> None:
 def main() -> None:
     st.set_page_config(page_title="SCI Judgement Downloader", layout="wide")
     ensure_state()
+    set_auto_exit_allowed(
+        bool(st.session_state.get("has_started_run", False))
+        and not bool(st.session_state.get("run_active", False))
+        and st.session_state.get("captcha") is None
+    )
+    run_startup_checks(force=False)
     drain_events()
 
     st.title("SCI Judgement Downloader")
     st.caption("Local frontend for Supreme Court of India judgment downloads.")
+    render_startup_checks()
 
     render_sidebar()
     render_captcha()
