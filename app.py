@@ -150,6 +150,7 @@ def ensure_state() -> None:
     state.setdefault("confirm_stop_exit", False)
     state.setdefault("exit_notice", False)
     state.setdefault("exit_notice_at", 0.0)
+    state.setdefault("show_success_banner", False)
 
 
 def build_ui_args() -> Any:
@@ -373,12 +374,14 @@ def drain_events() -> bool:
             st.session_state.run_active = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.show_success_banner = event["summary"].failed == 0
             needs_full_rerun = True
         elif event["type"] == "error":
             st.session_state.error_message = event["message"]
             st.session_state.run_active = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.show_success_banner = False
             needs_full_rerun = True
     return needs_full_rerun
 
@@ -546,6 +549,7 @@ def render_sidebar() -> None:
         st.session_state.has_started_run = True
         st.session_state.confirm_stop_exit = False
         st.session_state.exit_notice = False
+        st.session_state.show_success_banner = False
         bridge.start(build_ui_args())
         st.rerun()
 
@@ -755,6 +759,8 @@ def main() -> None:
 
     st.title("SCI Judgement Downloader")
     st.caption("Local frontend for Supreme Court of India judgment downloads.")
+    if st.session_state.get("show_success_banner", False):
+        st.success("Download finished successfully.")
     render_startup_checks()
 
     render_sidebar()
