@@ -16,6 +16,7 @@ import streamlit.components.v1 as components
 from main import SciJudgmentScraper, build_arg_parser, format_duration
 
 STARTUP_CHECK_CACHE_SECONDS = 30
+APP_OUTPUT_FOLDER_NAME = "SCIJudgmentDownloader"
 
 
 class QueueLogHandler(logging.Handler):
@@ -104,8 +105,15 @@ class FrontendRunBridge:
 def default_output_dir() -> str:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        return str(Path(local_app_data) / "SCIJudgmentDownloaderUI" / "downloads")
-    return str(Path.home() / "SCIJudgmentDownloaderUI" / "downloads")
+        return str(Path(local_app_data) / "SCIJudgmentDownloaderUI" / APP_OUTPUT_FOLDER_NAME)
+    return str(Path.home() / "SCIJudgmentDownloaderUI" / APP_OUTPUT_FOLDER_NAME)
+
+
+def normalize_output_dir(path_str: str) -> str:
+    base = Path(path_str).expanduser()
+    if base.name.lower() == APP_OUTPUT_FOLDER_NAME.lower():
+        return str(base)
+    return str(base / APP_OUTPUT_FOLDER_NAME)
 
 
 def ensure_state() -> None:
@@ -170,7 +178,7 @@ def build_ui_args() -> Any:
 
 def resolve_run_output_dir() -> str:
     chosen = st.session_state.output_dir.strip() or default_output_dir()
-    return str(Path(chosen))
+    return normalize_output_dir(chosen)
 
 
 def check_output_folder_writable(path_str: str) -> Dict[str, str]:
