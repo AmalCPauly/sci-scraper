@@ -743,10 +743,27 @@ class SciJudgmentScraper:
             raise ValueError("captcha_form_url is required when --human-captcha is enabled")
 
         emitted_ids = set()
-        for chunk_start, chunk_end in split_date_range(start_date, end_date, self.args.captcha_max_days):
+        all_chunks = split_date_range(start_date, end_date, self.args.captcha_max_days)
+        pending_chunks: List[Tuple[date, date]] = []
+        for chunk_start, chunk_end in all_chunks:
             if self._is_chunk_completed(chunk_start, chunk_end):
                 logging.info("Skipping completed chunk %s..%s (resume mode)", chunk_start, chunk_end)
                 continue
+            pending_chunks.append((chunk_start, chunk_end))
+
+        total_required = len(pending_chunks)
+        solved_chunks = 0
+        if self.progress_callback is not None:
+            self.progress_callback(
+                {
+                    "event": "captcha_progress",
+                    "total": total_required,
+                    "solved": solved_chunks,
+                    "remaining": total_required - solved_chunks,
+                }
+            )
+
+        for chunk_start, chunk_end in pending_chunks:
             chunk_started_at = time.perf_counter()
             chunk_stat: Dict[str, object] = {
                 "mode": "human_captcha",
@@ -762,6 +779,16 @@ class SciJudgmentScraper:
             }
             logging.info("Fetching judgments for %s to %s via CAPTCHA form", chunk_start, chunk_end)
             data, form_fields = self._solve_captcha_and_fetch_first_page(chunk_start, chunk_end)
+            solved_chunks += 1
+            if self.progress_callback is not None:
+                self.progress_callback(
+                    {
+                        "event": "captcha_progress",
+                        "total": total_required,
+                        "solved": solved_chunks,
+                        "remaining": max(0, total_required - solved_chunks),
+                    }
+                )
             if data is None:
                 chunk_stat["status"] = "no_data"
                 chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)

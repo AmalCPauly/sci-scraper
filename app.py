@@ -136,6 +136,7 @@ def ensure_state() -> None:
     state.setdefault("startup_checks_target", "")
     state.setdefault("startup_blocking_error", "")
     state.setdefault("captcha_seq", 0)
+    state.setdefault("captcha_progress", {"total": 0, "solved": 0, "remaining": 0})
 
 
 def build_ui_args() -> Any:
@@ -337,6 +338,12 @@ def drain_events() -> None:
                 st.session_state.progress = payload
             elif payload.get("event") == "summary":
                 st.session_state.summary = payload
+            elif payload.get("event") == "captcha_progress":
+                st.session_state.captcha_progress = {
+                    "total": int(payload.get("total", 0)),
+                    "solved": int(payload.get("solved", 0)),
+                    "remaining": int(payload.get("remaining", 0)),
+                }
         elif event["type"] == "captcha":
             st.session_state.captcha_seq = int(st.session_state.get("captcha_seq", 0)) + 1
             st.session_state.captcha = event
@@ -351,10 +358,12 @@ def drain_events() -> None:
             }
             st.session_state.run_active = False
             st.session_state.captcha = None
+            st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
         elif event["type"] == "error":
             st.session_state.error_message = event["message"]
             st.session_state.run_active = False
             st.session_state.captcha = None
+            st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
 
 
 def render_sidebar() -> None:
@@ -514,6 +523,7 @@ def render_sidebar() -> None:
         st.session_state.summary = None
         st.session_state.captcha = None
         st.session_state.error_message = ""
+        st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
         st.session_state.run_active = True
         st.session_state.has_started_run = True
         bridge.start(build_ui_args())
@@ -563,6 +573,15 @@ def render_status() -> None:
 
 
 def render_captcha() -> None:
+    captcha_progress = st.session_state.get("captcha_progress", {"total": 0, "solved": 0, "remaining": 0})
+    total = int(captcha_progress.get("total", 0))
+    solved = int(captcha_progress.get("solved", 0))
+    remaining = int(captcha_progress.get("remaining", 0))
+    if total > 0 and solved < total:
+        st.subheader("CAPTCHA Progress")
+        ratio = max(0.0, min(1.0, solved / total))
+        st.progress(ratio, text=f"Solved {solved}/{total} | Remaining {remaining}")
+
     challenge = st.session_state.captcha
     if not challenge:
         return
