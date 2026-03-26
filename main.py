@@ -222,6 +222,8 @@ class SciJudgmentScraper:
 
         self.last_request_at = 0.0
         self._session_bootstrapped = False
+        self._run_chunk_stats: List[Dict[str, object]] = []
+        self._run_failures: List[Dict[str, str]] = []
         self._init_csv_files()
 
     def _init_csv_files(self) -> None:
@@ -345,7 +347,11 @@ class SciJudgmentScraper:
             failed = 0
             pending: List[Tuple[JudgmentRecord, Path]] = []
             reserved_paths: Set[Path] = set()
+            self._run_chunk_stats = []
+            self._run_failures = []
             run_started_at = time.perf_counter()
+            run_started_iso = datetime.now().isoformat(timespec="seconds")
+            discovery_started_at = time.perf_counter()
 
             for record in self.iter_reportable_records(start_date, end_date):
                 if not self.should_keep_by_reportable_mode(record):
@@ -357,6 +363,7 @@ class SciJudgmentScraper:
                     continue
                 pending.append((record, self.build_download_path(record, reserved_paths)))
 
+            discovery_elapsed = time.perf_counter() - discovery_started_at
             if pending:
                 self.ensure_pdf_runtime_ready()
 
@@ -368,6 +375,7 @@ class SciJudgmentScraper:
                 )
                 self.print_progress(0, len(pending), 0, 0, 0)
 
+            download_started_at = time.perf_counter()
             completed_downloads = 0
             for record, local_path, error, elapsed_seconds in self.download_records_parallel(pending):
                 completed_downloads += 1
@@ -412,8 +420,10 @@ class SciJudgmentScraper:
             if pending:
                 self.safe_stdout_write("\n")
 
+            download_elapsed = time.perf_counter() - download_started_at
             total_elapsed = time.perf_counter() - run_started_at
             average_per_pdf = total_elapsed / processed if processed else 0.0
+            run_finished_iso = datetime.now().isoformat(timespec="seconds")
 
             summary = RunSummary(
                 processed=processed,
@@ -447,6 +457,15 @@ class SciJudgmentScraper:
                         "average_per_processed_seconds": average_per_pdf,
                     }
                 )
+            self.write_run_manifest(
+                start_date=start_date,
+                end_date=end_date,
+                run_started_iso=run_started_iso,
+                run_finished_iso=run_finished_iso,
+                discovery_elapsed=discovery_elapsed,
+                download_elapsed=download_elapsed,
+                summary=summary,
+            )
             if processed == 0:
                 logging.warning(
                     "No judgment records were discovered for the selected range. "
@@ -488,6 +507,16 @@ class SciJudgmentScraper:
         yield from self._iter_from_html(start_date, end_date)
 
     def _iter_from_api(self, start_date: date, end_date: date) -> Iterator[JudgmentRecord]:
+        chunk_started_at = time.perf_counter()
+        chunk_stat: Dict[str, object] = {
+            "mode": "api",
+            "chunk_start": start_date.isoformat(),
+            "chunk_end": end_date.isoformat(),
+            "pages_fetched": 0,
+            "raw_records": 0,
+            "yielded_records": 0,
+            "status": "ok",
+        }
         page = 1
         emitted_ids = set()
 
@@ -502,10 +531,12 @@ class SciJudgmentScraper:
             )
             response = self._request("GET", url)
             payload = response.json()
+            chunk_stat["pages_fetched"] = int(chunk_stat["pages_fetched"]) + 1
 
             records = extract_json_records(payload)
             if not records:
                 break
+            chunk_stat["raw_records"] = int(chunk_stat["raw_records"]) + len(records)
 
             yielded_this_page = 0
             for raw in records:
@@ -520,13 +551,27 @@ class SciJudgmentScraper:
                     continue
 
                 yielded_this_page += 1
+                chunk_stat["yielded_records"] = int(chunk_stat["yielded_records"]) + 1
                 yield record
 
             if yielded_this_page == 0 and self.args.stop_when_empty_page:
                 break
             page += 1
+        chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
+        self._run_chunk_stats.append(chunk_stat)
 
     def _iter_from_html(self, start_date: date, end_date: date) -> Iterator[JudgmentRecord]:
+        chunk_started_at = time.perf_counter()
+        chunk_stat: Dict[str, object] = {
+            "mode": "html",
+            "chunk_start": start_date.isoformat(),
+            "chunk_end": end_date.isoformat(),
+            "pages_visited": 0,
+            "candidate_records": 0,
+            "yielded_records": 0,
+            "captcha_gate_detected": False,
+            "status": "ok",
+        }
         next_url = self.args.index_url
         visited = set()
         emitted_ids = set()
@@ -538,13 +583,16 @@ class SciJudgmentScraper:
             if next_url in visited:
                 break
             visited.add(next_url)
+            chunk_stat["pages_visited"] = int(chunk_stat["pages_visited"]) + 1
 
             response = self._request("GET", next_url)
             soup = BeautifulSoup(response.text, "html.parser")
             if is_captcha_gated_judgment_page(soup):
                 captcha_gate_detected = True
+                chunk_stat["captcha_gate_detected"] = True
 
             candidates = parse_html_candidates(soup, next_url)
+            chunk_stat["candidate_records"] = int(chunk_stat["candidate_records"]) + len(candidates)
             for rec in candidates:
                 if rec.source_id in emitted_ids:
                     continue
@@ -552,6 +600,7 @@ class SciJudgmentScraper:
 
                 if not (start_date <= rec.judgment_date <= end_date):
                     continue
+                chunk_stat["yielded_records"] = int(chunk_stat["yielded_records"]) + 1
                 yield rec
 
             next_url = discover_next_page_url(soup, next_url)
@@ -561,6 +610,8 @@ class SciJudgmentScraper:
                 "Detected CAPTCHA-gated SCI judgments form. Automated record listing from HTML is blocked "
                 "without solving CAPTCHA. Use a non-CAPTCHA API source via --api-url, or add a human-in-the-loop captcha step."
             )
+        chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
+        self._run_chunk_stats.append(chunk_stat)
 
     def _iter_from_human_captcha_date_form(self, start_date: date, end_date: date) -> Iterator[JudgmentRecord]:
         if not self.args.captcha_form_url:
@@ -568,14 +619,32 @@ class SciJudgmentScraper:
 
         emitted_ids = set()
         for chunk_start, chunk_end in split_date_range(start_date, end_date, self.args.captcha_max_days):
+            chunk_started_at = time.perf_counter()
+            chunk_stat: Dict[str, object] = {
+                "mode": "human_captcha",
+                "chunk_start": chunk_start.isoformat(),
+                "chunk_end": chunk_end.isoformat(),
+                "first_page_direct_records": 0,
+                "first_page_detail_records": 0,
+                "pagination_pages_processed": 0,
+                "pagination_direct_records": 0,
+                "pagination_detail_records": 0,
+                "yielded_records": 0,
+                "status": "ok",
+            }
             logging.info("Fetching judgments for %s to %s via CAPTCHA form", chunk_start, chunk_end)
             data, form_fields = self._solve_captcha_and_fetch_first_page(chunk_start, chunk_end)
             if data is None:
+                chunk_stat["status"] = "no_data"
+                chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
+                self._run_chunk_stats.append(chunk_stat)
                 continue
 
             first_records, pagination, first_case_refs = parse_ajax_payload_to_records(data, self.args.index_url)
             detail_records = self._fetch_records_from_case_refs(first_case_refs)
             combined_first_page = merge_record_lists(first_records, detail_records)
+            chunk_stat["first_page_direct_records"] = len(first_records)
+            chunk_stat["first_page_detail_records"] = len(detail_records)
             logging.info(
                 "Chunk %s..%s: first page produced %s direct + %s detail records",
                 chunk_start,
@@ -589,11 +658,14 @@ class SciJudgmentScraper:
                 emitted_ids.add(rec.source_id)
                 if not (start_date <= rec.judgment_date <= end_date):
                     continue
+                chunk_stat["yielded_records"] = int(chunk_stat["yielded_records"]) + 1
                 yield rec
 
             nonce = pagination.get("nonce")
             page_ids = pagination.get("page_ids", [])
             if not nonce:
+                chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
+                self._run_chunk_stats.append(chunk_stat)
                 continue
 
             for page_id in page_ids:
@@ -603,6 +675,11 @@ class SciJudgmentScraper:
                 page_records, _, page_case_refs = parse_ajax_payload_to_records(page_data, self.args.index_url)
                 page_detail_records = self._fetch_records_from_case_refs(page_case_refs)
                 combined_page = merge_record_lists(page_records, page_detail_records)
+                chunk_stat["pagination_pages_processed"] = int(chunk_stat["pagination_pages_processed"]) + 1
+                chunk_stat["pagination_direct_records"] = int(chunk_stat["pagination_direct_records"]) + len(page_records)
+                chunk_stat["pagination_detail_records"] = int(chunk_stat["pagination_detail_records"]) + len(
+                    page_detail_records
+                )
                 logging.info(
                     "Chunk %s..%s page %s produced %s direct + %s detail records",
                     chunk_start,
@@ -617,7 +694,10 @@ class SciJudgmentScraper:
                     emitted_ids.add(rec.source_id)
                     if not (start_date <= rec.judgment_date <= end_date):
                         continue
+                    chunk_stat["yielded_records"] = int(chunk_stat["yielded_records"]) + 1
                     yield rec
+            chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
+            self._run_chunk_stats.append(chunk_stat)
 
     def _solve_captcha_and_fetch_first_page(
         self, chunk_start: date, chunk_end: date
@@ -921,16 +1001,74 @@ class SciJudgmentScraper:
             )
 
     def write_failure(self, record: JudgmentRecord, error: str) -> None:
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        self._run_failures.append(
+            {
+                "timestamp": timestamp,
+                "source_id": record.source_id,
+                "pdf_url": record.pdf_url,
+                "error": error,
+            }
+        )
         with self.failure_log_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(
                 [
-                    datetime.now().isoformat(timespec="seconds"),
+                    timestamp,
                     record.source_id,
                     record.pdf_url,
                     error,
                 ]
             )
+
+    def write_run_manifest(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        run_started_iso: str,
+        run_finished_iso: str,
+        discovery_elapsed: float,
+        download_elapsed: float,
+        summary: RunSummary,
+    ) -> None:
+        manifest = {
+            "run_id": f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            "started_at": run_started_iso,
+            "finished_at": run_finished_iso,
+            "input_params": self._serialize_input_params(start_date, end_date),
+            "timings": {
+                "discovery_seconds": round(discovery_elapsed, 3),
+                "download_seconds": round(download_elapsed, 3),
+                "total_seconds": round(summary.total_elapsed_seconds, 3),
+                "average_per_processed_seconds": round(summary.average_per_processed_seconds, 3),
+            },
+            "summary": {
+                "processed": summary.processed,
+                "downloaded": summary.downloaded,
+                "skipped": summary.skipped,
+                "failed": summary.failed,
+            },
+            "per_chunk_stats": self._run_chunk_stats,
+            "failures": self._run_failures,
+        }
+        manifest_path = self.output_dir / f"{manifest['run_id']}.json"
+        with manifest_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        logging.info("Run manifest written: %s", manifest_path)
+
+    def _serialize_input_params(self, start_date: date, end_date: date) -> Dict[str, object]:
+        raw: Dict[str, object] = {
+            "target_start_date": start_date.isoformat(),
+            "target_end_date": end_date.isoformat(),
+            "output_dir": str(self.output_dir),
+        }
+        for key, value in vars(self.args).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                raw[key] = value
+            else:
+                raw[key] = str(value)
+        return raw
 
 
 def resolve_date_range(args: argparse.Namespace) -> Tuple[date, date]:
