@@ -31,6 +31,7 @@ DATE_CANDIDATE_FORMATS = [
     "%d %B %Y",
 ]
 INTERNAL_DATA_DIR_NAME = ".scijudgment_data"
+STAGING_DIR_NAME = ".staging"
 
 
 @dataclass
@@ -195,6 +196,8 @@ class SciJudgmentScraper:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.internal_data_dir = self.output_dir / INTERNAL_DATA_DIR_NAME
         self.internal_data_dir.mkdir(parents=True, exist_ok=True)
+        self.staging_dir = self.output_dir / STAGING_DIR_NAME
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
 
         self.state = DownloadState(self.internal_data_dir / "download_state.sqlite3")
         self.failure_log_path = self.internal_data_dir / "failed_downloads.csv"
@@ -370,7 +373,7 @@ class SciJudgmentScraper:
                     skipped += 1
                     continue
                 final_path = self.build_download_path(record, reserved_paths)
-                temp_path = final_path.with_suffix(final_path.suffix + ".partial")
+                temp_path = self.build_staging_temp_path(record)
                 pending.append((record, final_path, temp_path))
 
             discovery_elapsed = time.perf_counter() - discovery_started_at
@@ -1026,6 +1029,12 @@ class SciJudgmentScraper:
             reserved_paths.add(file_path)
         return file_path
 
+    def build_staging_temp_path(self, record: JudgmentRecord) -> Path:
+        key = f"{record.source_id}|{record.pdf_url}|{record.judgment_date.isoformat()}"
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
+        filename = f"{record.judgment_date.strftime('%Y%m%d')}_{digest}.pdf.partial"
+        return self.staging_dir / filename
+
     def download_record(self, record: JudgmentRecord, file_path: Optional[Path] = None) -> Tuple[Path, float]:
         if file_path is None:
             file_path = self.build_download_path(record)
@@ -1040,6 +1049,7 @@ class SciJudgmentScraper:
         if "pdf" not in content_type and not record.pdf_url.lower().endswith(".pdf"):
             raise ValueError(f"Not a PDF response: {record.pdf_url} ({content_type})")
 
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         with file_path.open("wb") as f:
             for chunk in response.iter_content(chunk_size=1024 * 64):
                 if chunk:

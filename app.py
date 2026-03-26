@@ -152,7 +152,25 @@ def ensure_state() -> None:
     state.setdefault("confirm_stop_exit", False)
     state.setdefault("exit_notice", False)
     state.setdefault("exit_notice_at", 0.0)
+    state.setdefault("exit_cleanup_count", 0)
     state.setdefault("show_success_banner", False)
+
+
+def cleanup_partial_downloads(output_dir: str) -> int:
+    removed = 0
+    try:
+        root = Path(output_dir)
+        if not root.exists():
+            return 0
+        for partial in root.rglob("*.pdf.partial"):
+            try:
+                partial.unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                pass
+    except Exception:
+        return removed
+    return removed
 
 
 def build_ui_args() -> Any:
@@ -558,6 +576,7 @@ def render_sidebar() -> None:
         st.session_state.has_started_run = True
         st.session_state.confirm_stop_exit = False
         st.session_state.exit_notice = False
+        st.session_state.exit_cleanup_count = 0
         st.session_state.show_success_banner = False
         bridge.start(build_ui_args())
         st.rerun()
@@ -576,6 +595,9 @@ def render_sidebar() -> None:
                     bridge.submit_answer("q")
                 except Exception:
                     pass
+            st.session_state.exit_cleanup_count = cleanup_partial_downloads(
+                st.session_state.get("active_output_dir", resolve_run_output_dir())
+            )
             st.session_state.run_active = False
             st.session_state.captcha = None
             st.session_state.confirm_stop_exit = False
@@ -775,6 +797,9 @@ def main() -> None:
     if st.session_state.get("exit_notice", False):
         st.title("SCI Judgement Downloader")
         st.success("Application stopped successfully.")
+        removed_count = int(st.session_state.get("exit_cleanup_count", 0))
+        if removed_count > 0:
+            st.info(f"Cleaned up {removed_count} partial download file(s).")
         st.info("You may now close this tab.")
         started = float(st.session_state.get("exit_notice_at", 0.0))
         if started and (time.monotonic() - started) >= 2.0:
