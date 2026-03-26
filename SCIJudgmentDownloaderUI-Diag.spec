@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('app.py', '.'), ('main.py', '.')]
 binaries = []
-hiddenimports = ['urllib.robotparser', 'tkinter', 'tkinter.filedialog']
+hiddenimports = ['urllib.robotparser']
 tmp_ret = collect_all('pypdf')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit')
@@ -20,7 +20,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    noarchive=False,
+    noarchive=True,
     optimize=0,
 )
 pyz = PYZ(a.pure)
@@ -28,14 +28,14 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    [],
+    [('v', None, 'OPTION')],
     exclude_binaries=True,
-    name='SCIJudgmentDownloaderUI',
-    debug=False,
+    name='SCIJudgmentDownloaderUI-Diag',
+    debug=True,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -49,5 +49,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='SCIJudgmentDownloaderUI',
+    name='SCIJudgmentDownloaderUI-Diag',
 )

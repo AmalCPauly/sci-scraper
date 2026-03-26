@@ -3,6 +3,7 @@ import os
 import threading
 import time
 from datetime import date
+from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Optional
 
@@ -94,6 +95,13 @@ class FrontendRunBridge:
         self.event_queue.put({"type": "progress", "payload": payload})
 
 
+def default_output_dir() -> str:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return str(Path(local_app_data) / "SCIJudgmentDownloaderUI" / "downloads")
+    return str(Path.home() / "SCIJudgmentDownloaderUI" / "downloads")
+
+
 def ensure_state() -> None:
     state = st.session_state
     state.setdefault("bridge", None)
@@ -103,8 +111,8 @@ def ensure_state() -> None:
     state.setdefault("summary", None)
     state.setdefault("run_active", False)
     state.setdefault("error_message", "")
-    state.setdefault("output_dir", "downloads")
-    state.setdefault("active_output_dir", "downloads")
+    state.setdefault("output_dir", default_output_dir())
+    state.setdefault("active_output_dir", default_output_dir())
     state.setdefault("date_mode", "Month")
     state.setdefault("ui_mode", "Simple")
     state.setdefault("month_year_value", date.today().year)
@@ -147,7 +155,8 @@ def build_ui_args() -> Any:
 
 
 def resolve_run_output_dir() -> str:
-    return st.session_state.output_dir.strip() or "downloads"
+    chosen = st.session_state.output_dir.strip() or default_output_dir()
+    return str(Path(chosen))
 
 
 def pick_output_folder(initial_dir: str) -> Optional[str]:
@@ -288,16 +297,18 @@ def render_sidebar() -> None:
             disabled=st.session_state.run_active,
         )
 
-    st.sidebar.caption(f"Output folder: `{st.session_state.get('output_dir', 'downloads')}`")
+    st.sidebar.caption(f"Output folder: `{st.session_state.get('output_dir', default_output_dir())}`")
     browse_disabled = st.session_state.run_active
     if st.sidebar.button("Browse output folder", disabled=browse_disabled):
-        current = st.session_state.get("output_dir", "downloads")
+        current = st.session_state.get("output_dir", default_output_dir())
         selected = pick_output_folder(current)
         if selected:
             st.session_state.output_dir = selected
             st.rerun()
         else:
-            st.sidebar.warning("Folder picker is unavailable on this system.")
+            st.sidebar.warning(
+                f"Folder picker is unavailable on this system. Using default: {default_output_dir()}"
+            )
     st.sidebar.caption("Already-downloaded files in this folder will be skipped.")
     if st.session_state.ui_mode == "Advanced":
         st.session_state.download_workers = st.sidebar.slider(

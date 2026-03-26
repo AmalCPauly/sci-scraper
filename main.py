@@ -212,9 +212,11 @@ class SciJudgmentScraper:
 
         self.robot_parser = RobotFileParser()
         self.robot_parser.set_url(urljoin(args.index_url, "/robots.txt"))
+        self._robots_loaded = False
         if args.respect_robots:
             try:
                 self.robot_parser.read()
+                self._robots_loaded = True
             except Exception as exc:
                 logging.warning("Could not read robots.txt: %s", exc)
 
@@ -269,6 +271,9 @@ class SciJudgmentScraper:
 
     def _allowed_by_robots(self, url: str) -> bool:
         if not self.args.respect_robots:
+            return True
+        if not self._robots_loaded:
+            # Fail-open when robots.txt cannot be fetched (for example, SSL trust issues in VMs).
             return True
         if self.args.allow_admin_ajax and is_admin_ajax_url(url):
             return True

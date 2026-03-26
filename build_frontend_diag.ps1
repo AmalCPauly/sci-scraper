@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$appName = "SCIJudgmentDownloaderUI"
+$appName = "SCIJudgmentDownloaderUI-Diag"
 $venvPython = Join-Path $PSScriptRoot "venv\Scripts\python.exe"
 
 if (-not (Test-Path $venvPython)) {
@@ -11,7 +11,8 @@ if (-not (Test-Path $venvPython)) {
   --noconfirm `
   --clean `
   --name $appName `
-  --noconsole `
+  --console `
+  --debug all `
   --add-data "app.py;." `
   --add-data "main.py;." `
   --hidden-import urllib.robotparser `
@@ -22,4 +23,5 @@ if (-not (Test-Path $venvPython)) {
   launch_frontend.py
 
 Write-Host ""
-Write-Host "Build complete. Executable is in .\\dist\\$appName\\"
+Write-Host "Diagnostic build complete. Executable is in .\\dist\\$appName\\"
+Write-Host "Run it from CMD/PowerShell to capture startup errors."
