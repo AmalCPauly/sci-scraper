@@ -121,6 +121,7 @@ def ensure_state() -> None:
     state.setdefault("active_output_dir", default_output_dir())
     state.setdefault("date_mode", "Month")
     state.setdefault("ui_mode", "Simple")
+    state.setdefault("ui_mode_toggle", False)
     state.setdefault("month_year_value", date.today().year)
     state.setdefault("month_number_value", date.today().month)
     state.setdefault("year_value", date.today().year)
@@ -373,20 +374,21 @@ def drain_events() -> bool:
 def render_sidebar() -> None:
     st.sidebar.header("Run Options")
     today = date.today()
-    st.session_state.ui_mode = st.sidebar.toggle(
+    ui_mode_enabled = st.sidebar.toggle(
         "Advanced mode",
         value=st.session_state.get("ui_mode", "Simple") == "Advanced",
+        key="ui_mode_toggle",
         disabled=st.session_state.run_active,
     )
-    if st.session_state.ui_mode:
+    if ui_mode_enabled:
         st.session_state.ui_mode = "Advanced"
     else:
         st.session_state.ui_mode = "Simple"
 
-    st.session_state.date_mode = st.sidebar.radio(
+    st.sidebar.radio(
         "Date filter",
         ["Month", "Year", "Custom Range"],
-        index=["Month", "Year", "Custom Range"].index(st.session_state.get("date_mode", "Month")),
+        key="date_mode",
         disabled=st.session_state.run_active,
     )
     year_options = list(range(today.year, 1949, -1))
