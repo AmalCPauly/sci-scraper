@@ -196,6 +196,7 @@ class SciJudgmentScraper:
         self.state = DownloadState(self.output_dir / "download_state.sqlite3")
         self.failure_log_path = self.output_dir / "failed_downloads.csv"
         self.metadata_path = self.output_dir / "metadata.csv"
+        self.chunk_resume_path = self.output_dir / "chunk_resume_state.json"
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -224,7 +225,9 @@ class SciJudgmentScraper:
         self._session_bootstrapped = False
         self._run_chunk_stats: List[Dict[str, object]] = []
         self._run_failures: List[Dict[str, str]] = []
+        self._chunk_resume_state: Dict[str, object] = {}
         self._init_csv_files()
+        self.cleanup_stale_temp_downloads()
 
     def _init_csv_files(self) -> None:
         metadata_header = [
@@ -337,15 +340,17 @@ class SciJudgmentScraper:
         self._session_bootstrapped = True
 
     def run(self) -> RunSummary:
+        run_success = False
         try:
             start_date, end_date = resolve_date_range(self.args)
             logging.info("Target date range: %s to %s", start_date, end_date)
+            self._prepare_chunk_resume_state(start_date, end_date)
 
             processed = 0
             downloaded = 0
             skipped = 0
             failed = 0
-            pending: List[Tuple[JudgmentRecord, Path]] = []
+            pending: List[Tuple[JudgmentRecord, Path, Path]] = []
             reserved_paths: Set[Path] = set()
             self._run_chunk_stats = []
             self._run_failures = []
@@ -361,7 +366,9 @@ class SciJudgmentScraper:
                 if self.state.is_downloaded(record.source_id):
                     skipped += 1
                     continue
-                pending.append((record, self.build_download_path(record, reserved_paths)))
+                final_path = self.build_download_path(record, reserved_paths)
+                temp_path = final_path.with_suffix(final_path.suffix + ".partial")
+                pending.append((record, final_path, temp_path))
 
             discovery_elapsed = time.perf_counter() - discovery_started_at
             if pending:
@@ -377,7 +384,7 @@ class SciJudgmentScraper:
 
             download_started_at = time.perf_counter()
             completed_downloads = 0
-            for record, local_path, error, elapsed_seconds in self.download_records_parallel(pending):
+            for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
                 completed_downloads += 1
                 if error:
                     failed += 1
@@ -392,14 +399,21 @@ class SciJudgmentScraper:
                         "pdf",
                         "metadata_or_pdf",
                     }:
-                        if not is_pdf_reportable(local_path):
+                        if not is_pdf_reportable(temp_path):
                             skipped += 1
                             try:
-                                local_path.unlink(missing_ok=True)
+                                temp_path.unlink(missing_ok=True)
                             except Exception:
                                 pass
                             self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
                             continue
+
+                    local_path = final_path
+                    if self.args.dry_run:
+                        local_path = final_path
+                    else:
+                        temp_path.replace(final_path)
+                        local_path = final_path
 
                     neutral = extract_neutral_citation_from_pdf(local_path) or record.neutral_citation
                     if neutral:
@@ -414,6 +428,10 @@ class SciJudgmentScraper:
                     self.state.mark_failed(record, str(exc))
                     self.write_failure(record, str(exc))
                     logging.exception("Failed to finalize %s", record.source_id)
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 finally:
                     self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
 
@@ -472,8 +490,10 @@ class SciJudgmentScraper:
                     "The current listing page may be JS/API-driven or blocked; "
                     "run with --log-level DEBUG and prefer --api-url from browser Network tab."
                 )
+            run_success = True
             return summary
         finally:
+            self._finalize_chunk_resume_state(run_success)
             self.state.close()
 
     def ensure_pdf_runtime_ready(self) -> None:
@@ -619,6 +639,9 @@ class SciJudgmentScraper:
 
         emitted_ids = set()
         for chunk_start, chunk_end in split_date_range(start_date, end_date, self.args.captcha_max_days):
+            if self._is_chunk_completed(chunk_start, chunk_end):
+                logging.info("Skipping completed chunk %s..%s (resume mode)", chunk_start, chunk_end)
+                continue
             chunk_started_at = time.perf_counter()
             chunk_stat: Dict[str, object] = {
                 "mode": "human_captcha",
@@ -638,6 +661,7 @@ class SciJudgmentScraper:
                 chunk_stat["status"] = "no_data"
                 chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
                 self._run_chunk_stats.append(chunk_stat)
+                self._mark_chunk_completed(chunk_start, chunk_end)
                 continue
 
             first_records, pagination, first_case_refs = parse_ajax_payload_to_records(data, self.args.index_url)
@@ -698,6 +722,7 @@ class SciJudgmentScraper:
                     yield rec
             chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
             self._run_chunk_stats.append(chunk_stat)
+            self._mark_chunk_completed(chunk_start, chunk_end)
 
     def _solve_captcha_and_fetch_first_page(
         self, chunk_start: date, chunk_end: date
@@ -885,31 +910,31 @@ class SciJudgmentScraper:
         return file_path, time.perf_counter() - started_at
 
     def download_records_parallel(
-        self, pending: List[Tuple[JudgmentRecord, Path]]
-    ) -> Iterator[Tuple[JudgmentRecord, Path, Optional[str], float]]:
+        self, pending: List[Tuple[JudgmentRecord, Path, Path]]
+    ) -> Iterator[Tuple[JudgmentRecord, Path, Path, Optional[str], float]]:
         if not pending:
             return
         if self.args.dry_run or self.args.download_workers <= 1:
-            for record, file_path in pending:
+            for record, final_path, temp_path in pending:
                 try:
-                    downloaded_path, elapsed_seconds = self.download_record(record, file_path)
-                    yield record, downloaded_path, None, elapsed_seconds
+                    downloaded_path, elapsed_seconds = self.download_record(record, temp_path)
+                    yield record, final_path, downloaded_path, None, elapsed_seconds
                 except Exception as exc:
-                    yield record, file_path, str(exc), 0.0
+                    yield record, final_path, temp_path, str(exc), 0.0
             return
 
         with ThreadPoolExecutor(max_workers=self.args.download_workers) as executor:
             future_map = {
-                executor.submit(self.download_record, record, file_path): (record, file_path)
-                for record, file_path in pending
+                executor.submit(self.download_record, record, temp_path): (record, final_path, temp_path)
+                for record, final_path, temp_path in pending
             }
             for future in as_completed(future_map):
-                record, file_path = future_map[future]
+                record, final_path, temp_path = future_map[future]
                 try:
                     downloaded_path, elapsed_seconds = future.result()
-                    yield record, downloaded_path, None, elapsed_seconds
+                    yield record, final_path, downloaded_path, None, elapsed_seconds
                 except Exception as exc:
-                    yield record, file_path, str(exc), 0.0
+                    yield record, final_path, temp_path, str(exc), 0.0
 
     def print_progress(self, completed: int, total: int, downloaded: int, skipped: int, failed: int) -> None:
         if self.progress_callback is not None:
@@ -976,6 +1001,13 @@ class SciJudgmentScraper:
         candidate = dedupe_path(file_path.with_name(new_name))
         file_path.rename(candidate)
         return candidate
+
+    def cleanup_stale_temp_downloads(self) -> None:
+        try:
+            for temp_file in self.output_dir.rglob("*.pdf.partial"):
+                temp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def write_metadata(self, record: JudgmentRecord, local_path: Path) -> None:
         with self.metadata_path.open("a", newline="", encoding="utf-8") as f:
@@ -1069,6 +1101,92 @@ class SciJudgmentScraper:
             else:
                 raw[key] = str(value)
         return raw
+
+    def _chunk_key(self, chunk_start: date, chunk_end: date) -> str:
+        return f"{chunk_start.isoformat()}__{chunk_end.isoformat()}"
+
+    def _build_resume_signature(self, start_date: date, end_date: date) -> str:
+        signature_payload = {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "human_captcha": bool(self.args.human_captcha),
+            "captcha_max_days": int(self.args.captcha_max_days),
+            "reportable_mode": self.args.reportable_mode,
+            "reportable_check": self.args.reportable_check,
+            "output_dir": str(self.output_dir),
+            "index_url": self.args.index_url,
+            "api_url": self.args.api_url,
+            "captcha_form_url": self.args.captcha_form_url,
+        }
+        encoded = json.dumps(signature_payload, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    def _save_chunk_resume_state(self) -> None:
+        if not self._chunk_resume_state:
+            return
+        with self.chunk_resume_path.open("w", encoding="utf-8") as f:
+            json.dump(self._chunk_resume_state, f, ensure_ascii=False, indent=2)
+
+    def _prepare_chunk_resume_state(self, start_date: date, end_date: date) -> None:
+        if not (self.args.human_captcha and self.args.chunk_resume):
+            self._chunk_resume_state = {}
+            return
+
+        signature = self._build_resume_signature(start_date, end_date)
+        loaded: Dict[str, object] = {}
+        if self.chunk_resume_path.exists():
+            try:
+                loaded = json.loads(self.chunk_resume_path.read_text(encoding="utf-8"))
+            except Exception:
+                loaded = {}
+
+        if (
+            loaded.get("active") is True
+            and loaded.get("signature") == signature
+            and isinstance(loaded.get("chunks"), dict)
+        ):
+            self._chunk_resume_state = loaded
+            completed_count = len([v for v in loaded.get("chunks", {}).values() if v == "completed"])
+            logging.info("Resuming previous run by chunk. completed_chunks=%s", completed_count)
+            return
+
+        self._chunk_resume_state = {
+            "active": True,
+            "signature": signature,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "chunks": {},
+        }
+        self._save_chunk_resume_state()
+
+    def _is_chunk_completed(self, chunk_start: date, chunk_end: date) -> bool:
+        if not self._chunk_resume_state:
+            return False
+        chunks = self._chunk_resume_state.get("chunks")
+        if not isinstance(chunks, dict):
+            return False
+        return chunks.get(self._chunk_key(chunk_start, chunk_end)) == "completed"
+
+    def _mark_chunk_completed(self, chunk_start: date, chunk_end: date) -> None:
+        if not self._chunk_resume_state:
+            return
+        chunks = self._chunk_resume_state.setdefault("chunks", {})
+        if not isinstance(chunks, dict):
+            return
+        chunks[self._chunk_key(chunk_start, chunk_end)] = "completed"
+        self._save_chunk_resume_state()
+
+    def _finalize_chunk_resume_state(self, run_success: bool) -> None:
+        if not self._chunk_resume_state:
+            return
+        if run_success:
+            try:
+                self.chunk_resume_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        self._chunk_resume_state["active"] = True
+        self._chunk_resume_state["last_updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_chunk_resume_state()
 
 
 def resolve_date_range(args: argparse.Namespace) -> Tuple[date, date]:
@@ -1767,6 +1885,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="Maximum days per query chunk for CAPTCHA mode",
+    )
+    parser.add_argument(
+        "--chunk-resume",
+        action="store_true",
+        default=True,
+        help="Resume interrupted human-captcha runs by completed date chunks.",
+    )
+    parser.add_argument(
+        "--no-chunk-resume",
+        dest="chunk_resume",
+        action="store_false",
+        help="Disable chunk-level resume behavior.",
     )
     parser.add_argument(
         "--interactive-captcha",
