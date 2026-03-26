@@ -146,6 +146,9 @@ def ensure_state() -> None:
     state.setdefault("startup_blocking_error", "")
     state.setdefault("captcha_seq", 0)
     state.setdefault("captcha_progress", {"total": 0, "solved": 0, "remaining": 0})
+    state.setdefault("confirm_stop_exit", False)
+    state.setdefault("exit_notice", False)
+    state.setdefault("exit_notice_at", 0.0)
 
 
 def build_ui_args() -> Any:
@@ -540,18 +543,34 @@ def render_sidebar() -> None:
         st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
         st.session_state.run_active = True
         st.session_state.has_started_run = True
+        st.session_state.confirm_stop_exit = False
+        st.session_state.exit_notice = False
         bridge.start(build_ui_args())
         st.rerun()
 
-    if st.sidebar.button("Stop and Exit"):
-        bridge = st.session_state.get("bridge")
-        if bridge is not None:
-            try:
-                bridge.submit_answer("q")
-            except Exception:
-                pass
-        # Terminate the Streamlit process (and packaged EXE) immediately.
-        os._exit(0)
+    if not st.session_state.get("confirm_stop_exit", False):
+        if st.sidebar.button("Stop and Exit"):
+            st.session_state.confirm_stop_exit = True
+            st.rerun()
+    else:
+        st.sidebar.warning("Are you sure you want to stop the run and exit the app?")
+        col1, col2 = st.sidebar.columns(2)
+        if col1.button("Confirm Exit"):
+            bridge = st.session_state.get("bridge")
+            if bridge is not None:
+                try:
+                    bridge.submit_answer("q")
+                except Exception:
+                    pass
+            st.session_state.run_active = False
+            st.session_state.captcha = None
+            st.session_state.confirm_stop_exit = False
+            st.session_state.exit_notice = True
+            st.session_state.exit_notice_at = time.monotonic()
+            st.rerun()
+        if col2.button("Cancel"):
+            st.session_state.confirm_stop_exit = False
+            st.rerun()
 
 
 def render_status() -> None:
@@ -678,6 +697,15 @@ def render_live_sections() -> None:
 def main() -> None:
     st.set_page_config(page_title="SCI Judgement Downloader", layout="wide")
     ensure_state()
+    if st.session_state.get("exit_notice", False):
+        st.title("SCI Judgement Downloader")
+        st.success("Application stopped successfully.")
+        st.info("You may now close this tab.")
+        started = float(st.session_state.get("exit_notice_at", 0.0))
+        if started and (time.monotonic() - started) >= 2.0:
+            os._exit(0)
+        time.sleep(2.0)
+        os._exit(0)
     run_startup_checks(force=False)
 
     st.title("SCI Judgement Downloader")
