@@ -224,6 +224,7 @@ def drain_events() -> None:
 
 def render_sidebar() -> None:
     st.sidebar.header("Run Options")
+    today = date.today()
     st.session_state.ui_mode = st.sidebar.toggle(
         "Advanced mode",
         value=st.session_state.get("ui_mode", "Simple") == "Advanced",
@@ -240,11 +241,12 @@ def render_sidebar() -> None:
         index=["Month", "Year", "Custom Range"].index(st.session_state.get("date_mode", "Month")),
         disabled=st.session_state.run_active,
     )
-    year_options = list(range(1950, 2101))
+    year_options = list(range(today.year, 1949, -1))
+    validation_error = ""
     if st.session_state.date_mode == "Month":
-        selected_month_year = int(st.session_state.get("month_year_value", date.today().year))
+        selected_month_year = int(st.session_state.get("month_year_value", today.year))
         if selected_month_year not in year_options:
-            selected_month_year = date.today().year
+            selected_month_year = today.year
         st.session_state.month_year_value = st.sidebar.selectbox(
             "Year",
             options=year_options,
@@ -265,20 +267,22 @@ def render_sidebar() -> None:
             "November",
             "December",
         ]
-        selected_month_number = int(st.session_state.get("month_number_value", date.today().month))
-        if selected_month_number < 1 or selected_month_number > 12:
-            selected_month_number = date.today().month
+        max_month = today.month if st.session_state.month_year_value == today.year else 12
+        allowed_month_labels = month_labels[:max_month]
+        selected_month_number = int(st.session_state.get("month_number_value", today.month))
+        if selected_month_number < 1 or selected_month_number > max_month:
+            selected_month_number = max_month
         selected_month_label = st.sidebar.selectbox(
             "Month",
-            options=month_labels,
+            options=allowed_month_labels,
             index=selected_month_number - 1,
             disabled=st.session_state.run_active,
         )
-        st.session_state.month_number_value = month_labels.index(selected_month_label) + 1
+        st.session_state.month_number_value = allowed_month_labels.index(selected_month_label) + 1
     elif st.session_state.date_mode == "Year":
-        selected_year = int(st.session_state.get("year_value", date.today().year))
+        selected_year = int(st.session_state.get("year_value", today.year))
         if selected_year not in year_options:
-            selected_year = date.today().year
+            selected_year = today.year
         st.session_state.year_value = st.sidebar.selectbox(
             "Year",
             options=year_options,
@@ -289,13 +293,31 @@ def render_sidebar() -> None:
         st.session_state.from_date_value = st.sidebar.date_input(
             "From date",
             value=st.session_state.get("from_date_value"),
+            max_value=today,
             disabled=st.session_state.run_active,
         )
         st.session_state.to_date_value = st.sidebar.date_input(
             "To date",
             value=st.session_state.get("to_date_value"),
+            min_value=st.session_state.from_date_value,
+            max_value=today,
             disabled=st.session_state.run_active,
         )
+        if st.session_state.from_date_value > st.session_state.to_date_value:
+            validation_error = "From date cannot be later than To date."
+        elif st.session_state.from_date_value > today or st.session_state.to_date_value > today:
+            validation_error = "Future dates are not allowed."
+
+    if st.session_state.date_mode == "Year" and st.session_state.year_value > today.year:
+        validation_error = "Future years are not allowed."
+    if st.session_state.date_mode == "Month":
+        if st.session_state.month_year_value > today.year:
+            validation_error = "Future months are not allowed."
+        elif (
+            st.session_state.month_year_value == today.year
+            and st.session_state.month_number_value > today.month
+        ):
+            validation_error = "Future months are not allowed."
 
     st.sidebar.caption(f"Output folder: `{st.session_state.get('output_dir', default_output_dir())}`")
     browse_disabled = st.session_state.run_active
@@ -339,7 +361,13 @@ def render_sidebar() -> None:
             disabled=st.session_state.run_active,
         )
 
-    if st.sidebar.button("Start Download", disabled=st.session_state.run_active):
+    if validation_error:
+        st.sidebar.error(validation_error)
+
+    if st.sidebar.button(
+        "Start Download",
+        disabled=st.session_state.run_active or bool(validation_error),
+    ):
         bridge = FrontendRunBridge()
         st.session_state.bridge = bridge
         st.session_state.logs = []
