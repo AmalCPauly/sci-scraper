@@ -30,6 +30,7 @@ DATE_CANDIDATE_FORMATS = [
     "%d %b %Y",
     "%d %B %Y",
 ]
+INTERNAL_DATA_DIR_NAME = ".scijudgment_data"
 
 
 @dataclass
@@ -192,11 +193,13 @@ class SciJudgmentScraper:
         self.enable_terminal_progress = enable_terminal_progress
         self.output_dir = Path(args.output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.internal_data_dir = self.output_dir / INTERNAL_DATA_DIR_NAME
+        self.internal_data_dir.mkdir(parents=True, exist_ok=True)
 
-        self.state = DownloadState(self.output_dir / "download_state.sqlite3")
-        self.failure_log_path = self.output_dir / "failed_downloads.csv"
-        self.metadata_path = self.output_dir / "metadata.csv"
-        self.chunk_resume_path = self.output_dir / "chunk_resume_state.json"
+        self.state = DownloadState(self.internal_data_dir / "download_state.sqlite3")
+        self.failure_log_path = self.internal_data_dir / "failed_downloads.csv"
+        self.metadata_path = self.internal_data_dir / "metadata.csv"
+        self.chunk_resume_path = self.internal_data_dir / "chunk_resume_state.json"
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -1264,7 +1267,7 @@ class SciJudgmentScraper:
             "per_chunk_stats": self._run_chunk_stats,
             "failures": self._run_failures,
         }
-        manifest_path = self.output_dir / f"{manifest['run_id']}.json"
+        manifest_path = self.internal_data_dir / f"{manifest['run_id']}.json"
         with manifest_path.open("w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
         logging.info("Run manifest written: %s", manifest_path)

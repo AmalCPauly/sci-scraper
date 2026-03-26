@@ -18,6 +18,7 @@ from main import SciJudgmentScraper, build_arg_parser, format_duration
 
 STARTUP_CHECK_CACHE_SECONDS = 30
 APP_OUTPUT_FOLDER_NAME = "SCIJudgmentDownloader"
+INTERNAL_DATA_DIR_NAME = ".scijudgment_data"
 
 
 class QueueLogHandler(logging.Handler):
@@ -681,8 +682,9 @@ def render_outputs() -> None:
 
     import pathlib
 
-    metadata_file = pathlib.Path(output_dir) / "metadata.csv"
-    failed_file = pathlib.Path(output_dir) / "failed_downloads.csv"
+    internal_data_dir = pathlib.Path(output_dir) / INTERNAL_DATA_DIR_NAME
+    metadata_file = internal_data_dir / "metadata.csv"
+    failed_file = internal_data_dir / "failed_downloads.csv"
 
     col1, col2 = st.columns(2)
     if metadata_file.exists():
