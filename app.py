@@ -650,32 +650,27 @@ def render_logs() -> None:
     st.text_area("Run log", value="\n".join(st.session_state.logs[-120:]), height=320)
 
 
-def main() -> None:
-    st.set_page_config(page_title="SCI Judgement Downloader", layout="wide")
-    ensure_state()
-    run_startup_checks(force=False)
+@st.fragment(run_every="1s")
+def render_live_sections() -> None:
     drain_events()
-
-    st.title("SCI Judgement Downloader")
-    st.caption("Local frontend for Supreme Court of India judgment downloads.")
-    render_startup_checks()
-
-    render_sidebar()
     render_captcha()
     render_status()
     render_outputs()
     if st.session_state.ui_mode == "Advanced":
         render_logs()
 
-    if st.session_state.run_active and st.session_state.captcha is None:
-        time.sleep(1)
-        st.rerun()
-    elif st.session_state.run_active and st.session_state.captcha is not None:
-        time.sleep(10)
-        st.rerun()
-    else:
-        time.sleep(30)
-        st.rerun()
+
+def main() -> None:
+    st.set_page_config(page_title="SCI Judgement Downloader", layout="wide")
+    ensure_state()
+    run_startup_checks(force=False)
+
+    st.title("SCI Judgement Downloader")
+    st.caption("Local frontend for Supreme Court of India judgment downloads.")
+    render_startup_checks()
+
+    render_sidebar()
+    render_live_sections()
 
 
 if __name__ == "__main__":
