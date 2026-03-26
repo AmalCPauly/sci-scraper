@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import platform
 import threading
@@ -683,6 +684,50 @@ def render_logs() -> None:
     st.text_area("Run log", value="\n".join(st.session_state.logs[-120:]), height=320)
 
 
+def render_copy_logs_footer() -> None:
+    st.markdown("---")
+    st.caption("Support")
+    logs_text = "\n".join(st.session_state.logs)
+    logs_payload = json.dumps(logs_text)
+    disabled_attr = "disabled" if not logs_text else ""
+    components.html(
+        f"""
+        <div style="display:flex;align-items:center;gap:10px;">
+          <button id="copy-logs-btn" {disabled_attr}
+            style="
+              background:#111827;
+              color:#f9fafb;
+              border:1px solid #374151;
+              border-radius:8px;
+              padding:8px 12px;
+              cursor:pointer;
+              font-size:14px;">
+            Copy logs
+          </button>
+          <span id="copy-logs-status" style="font-size:13px;color:#9ca3af;"></span>
+        </div>
+        <script>
+          const btn = document.getElementById("copy-logs-btn");
+          const status = document.getElementById("copy-logs-status");
+          const text = {logs_payload};
+          if (btn) {{
+            btn.addEventListener("click", async () => {{
+              try {{
+                await navigator.clipboard.writeText(text);
+                status.textContent = "Logs copied to clipboard.";
+                status.style.color = "#22c55e";
+              }} catch (e) {{
+                status.textContent = "Clipboard blocked by browser. Please use logs from Advanced mode.";
+                status.style.color = "#f59e0b";
+              }}
+            }});
+          }}
+        </script>
+        """,
+        height=70,
+    )
+
+
 @st.fragment(run_every="1s")
 def render_live_sections() -> None:
     if drain_events():
@@ -714,6 +759,7 @@ def main() -> None:
 
     render_sidebar()
     render_live_sections()
+    render_copy_logs_footer()
 
 
 if __name__ == "__main__":
