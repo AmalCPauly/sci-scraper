@@ -140,6 +140,7 @@ def ensure_state() -> None:
     state.setdefault("download_workers", 16)
     state.setdefault("reportable_mode", "reportable")
     state.setdefault("reportable_check", "pdf")
+    state.setdefault("keep_run_diagnostics", False)
     state.setdefault("log_level", "INFO")
     state.setdefault("has_started_run", False)
     state.setdefault("startup_checks", None)
@@ -165,6 +166,7 @@ def build_ui_args() -> Any:
     args.download_workers = st.session_state.download_workers
     args.reportable_mode = st.session_state.reportable_mode
     args.reportable_check = st.session_state.reportable_check
+    args.keep_run_diagnostics = bool(st.session_state.get("keep_run_diagnostics", False))
     args.log_level = st.session_state.log_level
 
     mode = st.session_state.date_mode
@@ -525,6 +527,12 @@ def render_sidebar() -> None:
             ["INFO", "DEBUG", "WARNING", "ERROR"],
             index=["INFO", "DEBUG", "WARNING", "ERROR"].index(st.session_state.get("log_level", "INFO")),
             disabled=st.session_state.run_active,
+        )
+        st.session_state.keep_run_diagnostics = st.sidebar.toggle(
+            "Keep run diagnostics",
+            value=bool(st.session_state.get("keep_run_diagnostics", False)),
+            disabled=st.session_state.run_active,
+            help="When enabled, stores per-run manifest JSON files for troubleshooting.",
         )
 
     if validation_error:

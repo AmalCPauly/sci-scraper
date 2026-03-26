@@ -585,16 +585,17 @@ class SciJudgmentScraper:
                         "average_per_processed_seconds": average_per_pdf,
                     }
                 )
-            self.write_run_manifest(
-                start_date=start_date,
-                end_date=end_date,
-                run_started_iso=run_started_iso,
-                run_finished_iso=run_finished_iso,
-                discovery_elapsed=discovery_elapsed,
-                download_elapsed=download_elapsed,
-                parse_elapsed=parse_elapsed,
-                summary=summary,
-            )
+            if bool(getattr(self.args, "keep_run_diagnostics", True)):
+                self.write_run_manifest(
+                    start_date=start_date,
+                    end_date=end_date,
+                    run_started_iso=run_started_iso,
+                    run_finished_iso=run_finished_iso,
+                    discovery_elapsed=discovery_elapsed,
+                    download_elapsed=download_elapsed,
+                    parse_elapsed=parse_elapsed,
+                    summary=summary,
+                )
             if processed == 0:
                 logging.warning(
                     "No judgment records were discovered for the selected range. "
