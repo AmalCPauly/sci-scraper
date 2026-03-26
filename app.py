@@ -11,6 +11,11 @@ import streamlit as st
 
 from main import SciJudgmentScraper, build_arg_parser, format_duration
 
+AUTO_EXIT_GRACE_SECONDS = 90
+_HEARTBEAT_LOCK = threading.Lock()
+_LAST_HEARTBEAT = time.monotonic()
+_WATCHDOG_STARTED = False
+
 
 class QueueLogHandler(logging.Handler):
     def __init__(self, event_queue: Queue) -> None:
@@ -102,7 +107,33 @@ def default_output_dir() -> str:
     return str(Path.home() / "SCIJudgmentDownloaderUI" / "downloads")
 
 
+def touch_heartbeat() -> None:
+    global _LAST_HEARTBEAT
+    with _HEARTBEAT_LOCK:
+        _LAST_HEARTBEAT = time.monotonic()
+
+
+def ensure_watchdog_started() -> None:
+    global _WATCHDOG_STARTED
+    if _WATCHDOG_STARTED:
+        return
+
+    def watchdog_loop() -> None:
+        while True:
+            time.sleep(3)
+            with _HEARTBEAT_LOCK:
+                idle_for = time.monotonic() - _LAST_HEARTBEAT
+            if idle_for > AUTO_EXIT_GRACE_SECONDS:
+                os._exit(0)
+
+    thread = threading.Thread(target=watchdog_loop, daemon=True)
+    thread.start()
+    _WATCHDOG_STARTED = True
+
+
 def ensure_state() -> None:
+    touch_heartbeat()
+    ensure_watchdog_started()
     state = st.session_state
     state.setdefault("bridge", None)
     state.setdefault("logs", [])
@@ -489,6 +520,12 @@ def main() -> None:
 
     if st.session_state.run_active and st.session_state.captcha is None:
         time.sleep(1)
+        st.rerun()
+    elif st.session_state.run_active and st.session_state.captcha is not None:
+        time.sleep(10)
+        st.rerun()
+    else:
+        time.sleep(30)
         st.rerun()
 
 
