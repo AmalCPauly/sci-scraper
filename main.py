@@ -870,6 +870,7 @@ class SciJudgmentScraper:
         captcha_dir.mkdir(parents=True, exist_ok=True)
 
         for attempt in range(1, self.args.captcha_max_attempts + 1):
+            captcha_dir.mkdir(parents=True, exist_ok=True)
             page_response = self._request("GET", self.args.captcha_form_url)
             soup = BeautifulSoup(page_response.text, "html.parser")
 
