@@ -1370,8 +1370,13 @@ class SciJudgmentScraper:
 
 
 def resolve_date_range(args: argparse.Namespace) -> Tuple[date, date]:
+    today = date.today()
     if args.year:
-        return date(args.year, 1, 1), date(args.year, 12, 31)
+        start = date(args.year, 1, 1)
+        end = date(args.year, 12, 31)
+        if start > today:
+            raise ValueError(f"Selected year {args.year} is in the future.")
+        return start, min(end, today)
     if args.month:
         dt = datetime.strptime(args.month, "%Y-%m")
         start = date(dt.year, dt.month, 1)
@@ -1380,9 +1385,18 @@ def resolve_date_range(args: argparse.Namespace) -> Tuple[date, date]:
         else:
             next_month = date(dt.year, dt.month + 1, 1)
             end = next_month.fromordinal(next_month.toordinal() - 1)
-        return start, end
+        if start > today:
+            raise ValueError(f"Selected month {args.month} is in the future.")
+        return start, min(end, today)
     if args.from_date and args.to_date:
-        return parse_date(args.from_date), parse_date(args.to_date)
+        start = parse_date(args.from_date)
+        end = parse_date(args.to_date)
+        if start > today:
+            raise ValueError("Selected date range starts in the future.")
+        end = min(end, today)
+        if start > end:
+            raise ValueError("Invalid date range after applying today's date limit.")
+        return start, end
     raise ValueError("Provide either --year, --month, or both --from-date and --to-date")
 
 
