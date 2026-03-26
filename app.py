@@ -14,12 +14,7 @@ import streamlit as st
 
 from main import SciJudgmentScraper, build_arg_parser, format_duration
 
-AUTO_EXIT_GRACE_SECONDS = 90
 STARTUP_CHECK_CACHE_SECONDS = 30
-_HEARTBEAT_LOCK = threading.Lock()
-_LAST_HEARTBEAT = time.monotonic()
-_WATCHDOG_STARTED = False
-_AUTO_EXIT_ALLOWED = False
 
 
 class QueueLogHandler(logging.Handler):
@@ -112,40 +107,7 @@ def default_output_dir() -> str:
     return str(Path.home() / "SCIJudgmentDownloaderUI" / "downloads")
 
 
-def touch_heartbeat() -> None:
-    global _LAST_HEARTBEAT
-    with _HEARTBEAT_LOCK:
-        _LAST_HEARTBEAT = time.monotonic()
-
-
-def set_auto_exit_allowed(allowed: bool) -> None:
-    global _AUTO_EXIT_ALLOWED
-    with _HEARTBEAT_LOCK:
-        _AUTO_EXIT_ALLOWED = allowed
-
-
-def ensure_watchdog_started() -> None:
-    global _WATCHDOG_STARTED
-    if _WATCHDOG_STARTED:
-        return
-
-    def watchdog_loop() -> None:
-        while True:
-            time.sleep(3)
-            with _HEARTBEAT_LOCK:
-                idle_for = time.monotonic() - _LAST_HEARTBEAT
-                auto_exit_allowed = _AUTO_EXIT_ALLOWED
-            if auto_exit_allowed and idle_for > AUTO_EXIT_GRACE_SECONDS:
-                os._exit(0)
-
-    thread = threading.Thread(target=watchdog_loop, daemon=True)
-    thread.start()
-    _WATCHDOG_STARTED = True
-
-
 def ensure_state() -> None:
-    touch_heartbeat()
-    ensure_watchdog_started()
     state = st.session_state
     state.setdefault("bridge", None)
     state.setdefault("logs", [])
@@ -650,11 +612,6 @@ def render_logs() -> None:
 def main() -> None:
     st.set_page_config(page_title="SCI Judgement Downloader", layout="wide")
     ensure_state()
-    set_auto_exit_allowed(
-        bool(st.session_state.get("has_started_run", False))
-        and not bool(st.session_state.get("run_active", False))
-        and st.session_state.get("captcha") is None
-    )
     run_startup_checks(force=False)
     drain_events()
 

@@ -1,5 +1,5 @@
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 import csv
 import hashlib
 import json
@@ -371,51 +371,61 @@ class SciJudgmentScraper:
                 pending.append((record, final_path, temp_path))
 
             discovery_elapsed = time.perf_counter() - discovery_started_at
-            if pending:
+            needs_pdf_runtime = bool(pending) and not self.args.dry_run
+            if needs_pdf_runtime:
                 self.ensure_pdf_runtime_ready()
 
             if pending:
                 logging.info(
-                    "Prepared %s judgments for download using %s worker(s)",
+                    "Prepared %s judgments for download using %s download worker(s) and %s parse worker(s)",
                     len(pending),
                     self.args.download_workers,
+                    self.args.parse_workers,
                 )
                 self.print_progress(0, len(pending), 0, 0, 0)
 
             download_started_at = time.perf_counter()
-            completed_downloads = 0
-            for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
-                completed_downloads += 1
-                if error:
-                    failed += 1
-                    self.state.mark_failed(record, error)
-                    self.write_failure(record, error)
-                    logging.error("Failed to download %s: %s", record.source_id, error)
-                    self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
-                    continue
+            parse_started_at = time.perf_counter()
+            completed_items = 0
 
+            def finalize_parsed_item(
+                record: JudgmentRecord,
+                final_path: Path,
+                temp_path: Path,
+                is_reportable: bool,
+                neutral: Optional[str],
+                error: Optional[str],
+            ) -> None:
+                nonlocal downloaded, skipped, failed
                 try:
-                    if self.args.reportable_mode == "reportable" and self.args.reportable_check in {
-                        "pdf",
-                        "metadata_or_pdf",
-                    }:
-                        if not is_pdf_reportable(temp_path):
-                            skipped += 1
-                            try:
-                                temp_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                            self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
-                            continue
+                    if error:
+                        failed += 1
+                        self.state.mark_failed(record, error)
+                        self.write_failure(record, error)
+                        logging.error("Failed to analyze %s: %s", record.source_id, error)
+                        try:
+                            temp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return
 
-                    local_path = final_path
+                    if self.args.dry_run:
+                        is_reportable = True
+
+                    if not is_reportable:
+                        skipped += 1
+                        try:
+                            temp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return
+
                     if self.args.dry_run:
                         local_path = final_path
                     else:
                         temp_path.replace(final_path)
                         local_path = final_path
 
-                    neutral = extract_neutral_citation_from_pdf(local_path) or record.neutral_citation
                     if neutral:
                         record.neutral_citation = neutral
                         local_path = self.rename_with_neutral_citation(local_path, neutral)
@@ -432,13 +442,110 @@ class SciJudgmentScraper:
                         temp_path.unlink(missing_ok=True)
                     except Exception:
                         pass
-                finally:
-                    self.print_progress(completed_downloads, len(pending), downloaded, skipped, failed)
 
+            if self.args.dry_run:
+                for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
+                    completed_items += 1
+                    if error:
+                        failed += 1
+                        self.state.mark_failed(record, error)
+                        self.write_failure(record, error)
+                        logging.error("Failed to download %s: %s", record.source_id, error)
+                    else:
+                        finalize_parsed_item(
+                            record,
+                            final_path,
+                            temp_path,
+                            True,
+                            record.neutral_citation,
+                            None,
+                        )
+                    self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+            else:
+                parse_futures = {}
+                with ThreadPoolExecutor(max_workers=self.args.parse_workers) as parse_executor:
+                    for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
+                        if error:
+                            failed += 1
+                            completed_items += 1
+                            self.state.mark_failed(record, error)
+                            self.write_failure(record, error)
+                            logging.error("Failed to download %s: %s", record.source_id, error)
+                            self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+                            continue
+
+                        future = parse_executor.submit(self._analyze_single_download, record, temp_path)
+                        parse_futures[future] = (record, final_path, temp_path)
+
+                        while parse_futures:
+                            done, _ = wait(set(parse_futures.keys()), timeout=0, return_when=FIRST_COMPLETED)
+                            if not done:
+                                break
+                            for parsed_future in done:
+                                default_record, default_final_path, default_temp_path = parse_futures.pop(parsed_future)
+                                try:
+                                    (
+                                        analyzed_record,
+                                        analyzed_path,
+                                        is_reportable,
+                                        neutral,
+                                        parse_error,
+                                    ) = parsed_future.result()
+                                    finalize_parsed_item(
+                                        analyzed_record,
+                                        default_final_path,
+                                        analyzed_path,
+                                        is_reportable,
+                                        neutral,
+                                        parse_error,
+                                    )
+                                except Exception as exc:
+                                    finalize_parsed_item(
+                                        default_record,
+                                        default_final_path,
+                                        default_temp_path,
+                                        False,
+                                        None,
+                                        str(exc),
+                                    )
+                                completed_items += 1
+                                self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+
+                    for parsed_future in as_completed(list(parse_futures.keys())):
+                        default_record, default_final_path, default_temp_path = parse_futures.pop(parsed_future)
+                        try:
+                            (
+                                analyzed_record,
+                                analyzed_path,
+                                is_reportable,
+                                neutral,
+                                parse_error,
+                            ) = parsed_future.result()
+                            finalize_parsed_item(
+                                analyzed_record,
+                                default_final_path,
+                                analyzed_path,
+                                is_reportable,
+                                neutral,
+                                parse_error,
+                            )
+                        except Exception as exc:
+                            finalize_parsed_item(
+                                default_record,
+                                default_final_path,
+                                default_temp_path,
+                                False,
+                                None,
+                                str(exc),
+                            )
+                        completed_items += 1
+                        self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+
+            download_elapsed = time.perf_counter() - download_started_at
             if pending:
                 self.safe_stdout_write("\n")
 
-            download_elapsed = time.perf_counter() - download_started_at
+            parse_elapsed = time.perf_counter() - parse_started_at
             total_elapsed = time.perf_counter() - run_started_at
             average_per_pdf = total_elapsed / processed if processed else 0.0
             run_finished_iso = datetime.now().isoformat(timespec="seconds")
@@ -482,6 +589,7 @@ class SciJudgmentScraper:
                 run_finished_iso=run_finished_iso,
                 discovery_elapsed=discovery_elapsed,
                 download_elapsed=download_elapsed,
+                parse_elapsed=parse_elapsed,
                 summary=summary,
             )
             if processed == 0:
@@ -497,11 +605,8 @@ class SciJudgmentScraper:
             self.state.close()
 
     def ensure_pdf_runtime_ready(self) -> None:
-        if self.args.reportable_mode == "reportable" and self.args.reportable_check in {
-            "pdf",
-            "metadata_or_pdf",
-        }:
-            ensure_pypdf_available()
+        if self.args.dry_run:
+            return
         ensure_pypdf_available()
 
     def should_keep_by_reportable_mode(self, record: JudgmentRecord) -> bool:
@@ -936,6 +1041,52 @@ class SciJudgmentScraper:
                 except Exception as exc:
                     yield record, final_path, temp_path, str(exc), 0.0
 
+    def _analyze_single_download(
+        self, record: JudgmentRecord, temp_path: Path
+    ) -> Tuple[JudgmentRecord, Path, bool, Optional[str], Optional[str]]:
+        try:
+            is_reportable = True
+            if self.args.reportable_mode == "reportable" and self.args.reportable_check in {
+                "pdf",
+                "metadata_or_pdf",
+            }:
+                is_reportable = is_pdf_reportable(temp_path)
+            neutral = extract_neutral_citation_from_pdf(temp_path) or record.neutral_citation
+            return record, temp_path, is_reportable, neutral, None
+        except Exception as exc:
+            return record, temp_path, False, None, str(exc)
+
+    def analyze_downloads_parallel(
+        self, pending: List[Tuple[JudgmentRecord, Path, Path]]
+    ) -> Iterator[Tuple[JudgmentRecord, Path, Path, bool, Optional[str], Optional[str]]]:
+        if not pending:
+            return
+        if self.args.dry_run:
+            for record, final_path, temp_path in pending:
+                yield record, final_path, temp_path, True, record.neutral_citation, None
+            return
+
+        if self.args.parse_workers <= 1:
+            for record, final_path, temp_path in pending:
+                analyzed_record, analyzed_path, is_reportable, neutral, error = self._analyze_single_download(
+                    record, temp_path
+                )
+                yield analyzed_record, final_path, analyzed_path, is_reportable, neutral, error
+            return
+
+        with ThreadPoolExecutor(max_workers=self.args.parse_workers) as executor:
+            future_map = {
+                executor.submit(self._analyze_single_download, record, temp_path): (record, final_path, temp_path)
+                for record, final_path, temp_path in pending
+            }
+            for future in as_completed(future_map):
+                record, final_path, temp_path = future_map[future]
+                try:
+                    analyzed_record, analyzed_path, is_reportable, neutral, error = future.result()
+                    yield analyzed_record, final_path, analyzed_path, is_reportable, neutral, error
+                except Exception as exc:
+                    yield record, final_path, temp_path, False, None, str(exc)
+
     def print_progress(self, completed: int, total: int, downloaded: int, skipped: int, failed: int) -> None:
         if self.progress_callback is not None:
             self.progress_callback(
@@ -1062,6 +1213,7 @@ class SciJudgmentScraper:
         run_finished_iso: str,
         discovery_elapsed: float,
         download_elapsed: float,
+        parse_elapsed: float,
         summary: RunSummary,
     ) -> None:
         manifest = {
@@ -1072,6 +1224,7 @@ class SciJudgmentScraper:
             "timings": {
                 "discovery_seconds": round(discovery_elapsed, 3),
                 "download_seconds": round(download_elapsed, 3),
+                "parse_seconds": round(parse_elapsed, 3),
                 "total_seconds": round(summary.total_elapsed_seconds, 3),
                 "average_per_processed_seconds": round(summary.average_per_processed_seconds, 3),
             },
@@ -1916,6 +2069,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of parallel workers used for PDF downloads.",
     )
     parser.add_argument(
+        "--parse-workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers used for PDF parsing/classification.",
+    )
+    parser.add_argument(
         "--reportable-mode",
         default="reportable",
         choices=["reportable", "all"],
@@ -1979,6 +2138,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.download_workers < 1:
         parser.error("--download-workers must be at least 1")
+    if args.parse_workers < 1:
+        parser.error("--parse-workers must be at least 1")
     configure_logging(args.log_level)
 
     try:
