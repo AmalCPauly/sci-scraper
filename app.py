@@ -605,6 +605,16 @@ def render_status() -> None:
             f"Average per processed document: `{format_duration(summary['average_per_processed_seconds'])}`"
         )
         st.write(f"Output folder: `{st.session_state.active_output_dir}`")
+        if st.button("Open output folder"):
+            output_dir = Path(st.session_state.active_output_dir)
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if os.name == "nt" and hasattr(os, "startfile"):
+                    os.startfile(str(output_dir))  # type: ignore[attr-defined]
+                else:
+                    st.info(f"Open this folder manually: {output_dir}")
+            except Exception as exc:
+                st.error(f"Could not open output folder: {exc}")
 
     if st.session_state.error_message:
         st.error(st.session_state.error_message)
