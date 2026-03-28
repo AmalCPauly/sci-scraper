@@ -365,6 +365,8 @@ class SciJudgmentScraper:
             failed = 0
             pending: List[Tuple[JudgmentRecord, Path, Path]] = []
             reserved_paths: Set[Path] = set()
+            selected_by_key: Dict[str, JudgmentRecord] = {}
+            selected_unique: List[JudgmentRecord] = []
             self._run_chunk_stats = []
             self._run_failures = []
             run_started_at = time.perf_counter()
@@ -376,7 +378,27 @@ class SciJudgmentScraper:
                     skipped += 1
                     self.write_decision(record, "skipped", "filtered_before_download")
                     continue
-                processed += 1
+                dedupe_key = build_pre_download_group_key(record)
+                if dedupe_key is None:
+                    selected_unique.append(record)
+                    continue
+                existing = selected_by_key.get(dedupe_key)
+                if existing is None:
+                    selected_by_key[dedupe_key] = record
+                    continue
+                if score_record_for_pre_download_selection(record) > score_record_for_pre_download_selection(existing):
+                    self.write_decision(existing, "skipped", "duplicate_variant_preferred_other")
+                    selected_by_key[dedupe_key] = record
+                else:
+                    self.write_decision(record, "skipped", "duplicate_variant_lower_priority")
+                skipped += 1
+
+            discovery_elapsed = time.perf_counter() - discovery_started_at
+            selected_records = selected_unique + list(selected_by_key.values())
+            selected_records.sort(key=lambda r: (r.judgment_date.isoformat(), normalize_ws(r.case_title).lower(), r.source_id))
+            processed = len(selected_records)
+
+            for record in selected_records:
                 if self.state.is_downloaded(record.source_id):
                     skipped += 1
                     self.write_decision(record, "skipped", "already_downloaded")
@@ -384,8 +406,6 @@ class SciJudgmentScraper:
                 final_path = self.build_download_path(record, reserved_paths)
                 temp_path = self.build_staging_temp_path(record)
                 pending.append((record, final_path, temp_path))
-
-            discovery_elapsed = time.perf_counter() - discovery_started_at
 
             needs_pdf_runtime = bool(pending) and not self.args.dry_run
             if needs_pdf_runtime:
@@ -1981,14 +2001,15 @@ def build_judgment_group_key(record: JudgmentRecord) -> str:
     party = normalize_ws(record.petitioner_respondent or record.case_title).lower()
     diary = normalize_ws(record.diary_number or "").lower()
     case_no = normalize_ws(record.case_number or "").lower()
-    # Keep grouping stable across variants (date-link PDF vs INSC-link PDF) and detail/listing mixes.
-    # Bench/judgment_by often vary in formatting and may split the same judgment into separate groups.
+    # Avoid over-merging: only rely on shared docket identifiers when available.
+    if diary or case_no:
+        return "|".join([record.judgment_date.isoformat(), diary, case_no, party])
+    # If docket ids are missing, fall back to source_id to prevent collapsing distinct judgments.
     return "|".join(
         [
             record.judgment_date.isoformat(),
-            diary,
-            case_no,
             party,
+            record.source_id,
         ]
     )
 
@@ -2030,7 +2051,7 @@ def select_preferred_record_index(
     entries: List[Tuple[JudgmentRecord, Path, Path, bool, Optional[str], Optional[str]]]
 ) -> int:
     best_index = 0
-    best_score = (-1, -1, -1, -1, 0)
+    best_score = (-1, -1, -1, 0, 0)
     for i, (record, _, _, is_reportable, neutral, error) in enumerate(entries):
         has_error = bool(error)
         has_neutral_link_label = extract_neutral_citation_from_text(record.pdf_label or "") is not None
@@ -2040,9 +2061,8 @@ def select_preferred_record_index(
         score = (
             0 if has_error else 1,
             1 if is_reportable else 0,
-            1 if has_neutral_link_label else 0,
-            1 if has_neutral else 0,
             1 if is_probably_english_record(record) else 0,
+            1 if has_neutral else 0,
             -len(record.pdf_url or ""),
         )
         if score > best_score:
@@ -2053,13 +2073,21 @@ def select_preferred_record_index(
 
 def score_record_for_pre_download_selection(record: JudgmentRecord) -> Tuple[int, int, int, int]:
     label = record.pdf_label or ""
-    citation = record.citation or ""
     url = record.pdf_url or ""
-    has_neutral_label = 1 if extract_neutral_citation_from_text(label) else 0
-    has_neutral_any = 1 if (has_neutral_label or extract_neutral_citation_from_text(citation)) else 0
     english_hint = 1 if is_probably_english_record(record) else 0
-    # Prefer canonical/shorter links in total ties.
-    return (has_neutral_label, has_neutral_any, english_hint, -len(url))
+    has_neutral_label = 1 if extract_neutral_citation_from_text(label) else 0
+    # English first; neutral-citation label only as a soft tie-breaker.
+    return (english_hint, has_neutral_label, 1 if bool(label) else 0, -len(url))
+
+
+def build_pre_download_group_key(record: JudgmentRecord) -> Optional[str]:
+    diary = normalize_ws(record.diary_number or "").lower()
+    case_no = normalize_ws(record.case_number or "").lower()
+    party = normalize_ws(record.petitioner_respondent or record.case_title).lower()
+    if diary or case_no:
+        return "|".join([record.judgment_date.isoformat(), diary, case_no, party])
+    # Without strong identifiers, do not collapse pre-download candidates.
+    return None
 
 
 def extract_value_after_label(text: str, labels: List[str]) -> Optional[str]:
