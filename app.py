@@ -790,8 +790,8 @@ def render_live_sections() -> None:
         st.rerun()
     render_captcha()
     render_status()
-    render_outputs()
     if st.session_state.ui_mode == "Advanced":
+        render_outputs()
         render_logs()
 
 
@@ -820,7 +820,8 @@ def main() -> None:
 
     render_sidebar()
     render_live_sections()
-    render_copy_logs_footer()
+    if st.session_state.ui_mode == "Advanced":
+        render_copy_logs_footer()
 
 
 if __name__ == "__main__":
