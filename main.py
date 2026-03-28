@@ -50,6 +50,7 @@ class JudgmentRecord:
     bench: Optional[str] = None
     citation: Optional[str] = None
     reportable_raw: Optional[str] = None
+    pdf_label: Optional[str] = None
 
 
 @dataclass
@@ -202,6 +203,7 @@ class SciJudgmentScraper:
         self.state = DownloadState(self.internal_data_dir / "download_state.sqlite3")
         self.failure_log_path = self.internal_data_dir / "failed_downloads.csv"
         self.metadata_path = self.internal_data_dir / "metadata.csv"
+        self.decision_log_path = self.internal_data_dir / "decision_log.csv"
         self.chunk_resume_path = self.internal_data_dir / "chunk_resume_state.json"
 
         self.session = requests.Session()
@@ -274,6 +276,11 @@ class SciJudgmentScraper:
             with self.failure_log_path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["timestamp", "source_id", "pdf_url", "error"])
+
+        if not self.decision_log_path.exists():
+            with self.decision_log_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["timestamp", "source_id", "pdf_url", "decision", "reason"])
 
     def _sleep_if_needed(self) -> None:
         elapsed = time.time() - self.last_request_at
@@ -367,16 +374,19 @@ class SciJudgmentScraper:
             for record in self.iter_reportable_records(start_date, end_date):
                 if not self.should_keep_by_reportable_mode(record):
                     skipped += 1
+                    self.write_decision(record, "skipped", "filtered_before_download")
                     continue
                 processed += 1
                 if self.state.is_downloaded(record.source_id):
                     skipped += 1
+                    self.write_decision(record, "skipped", "already_downloaded")
                     continue
                 final_path = self.build_download_path(record, reserved_paths)
                 temp_path = self.build_staging_temp_path(record)
                 pending.append((record, final_path, temp_path))
 
             discovery_elapsed = time.perf_counter() - discovery_started_at
+
             needs_pdf_runtime = bool(pending) and not self.args.dry_run
             if needs_pdf_runtime:
                 self.ensure_pdf_runtime_ready()
@@ -393,6 +403,13 @@ class SciJudgmentScraper:
             download_started_at = time.perf_counter()
             parse_started_at = time.perf_counter()
             completed_items = 0
+            judgment_group_totals: Dict[str, int] = {}
+            for rec, _, _ in pending:
+                group_key = build_judgment_group_key(rec)
+                judgment_group_totals[group_key] = judgment_group_totals.get(group_key, 0) + 1
+            buffered_group_results: Dict[
+                str, List[Tuple[JudgmentRecord, Path, Path, bool, Optional[str], Optional[str]]]
+            ] = {}
 
             def finalize_parsed_item(
                 record: JudgmentRecord,
@@ -408,6 +425,7 @@ class SciJudgmentScraper:
                         failed += 1
                         self.state.mark_failed(record, error)
                         self.write_failure(record, error)
+                        self.write_decision(record, "failed", f"analyze_error: {error}")
                         logging.error("Failed to analyze %s: %s", record.source_id, error)
                         try:
                             temp_path.unlink(missing_ok=True)
@@ -418,8 +436,9 @@ class SciJudgmentScraper:
                     if self.args.dry_run:
                         is_reportable = True
 
-                    if not is_reportable:
+                    if self.args.reportable_mode == "reportable" and not is_reportable:
                         skipped += 1
+                        self.write_decision(record, "skipped", "pdf_not_reportable")
                         try:
                             temp_path.unlink(missing_ok=True)
                         except Exception:
@@ -438,16 +457,70 @@ class SciJudgmentScraper:
 
                     self.state.mark_downloaded(record, local_path)
                     self.write_metadata(record, local_path)
+                    self.write_decision(record, "downloaded", "ok")
                     downloaded += 1
                 except Exception as exc:
                     failed += 1
                     self.state.mark_failed(record, str(exc))
                     self.write_failure(record, str(exc))
+                    self.write_decision(record, "failed", f"finalize_error: {exc}")
                     logging.exception("Failed to finalize %s", record.source_id)
                     try:
                         temp_path.unlink(missing_ok=True)
                     except Exception:
                         pass
+
+            def handle_analyzed_item(
+                record: JudgmentRecord,
+                final_path: Path,
+                temp_path: Path,
+                is_reportable: bool,
+                neutral: Optional[str],
+                error: Optional[str],
+            ) -> None:
+                if error:
+                    finalize_parsed_item(record, final_path, temp_path, is_reportable, neutral, error)
+                    return
+
+                group_key = build_judgment_group_key(record)
+                if judgment_group_totals.get(group_key, 0) <= 1:
+                    finalize_parsed_item(record, final_path, temp_path, is_reportable, neutral, None)
+                    return
+
+                group_entries = buffered_group_results.setdefault(group_key, [])
+                group_entries.append((record, final_path, temp_path, is_reportable, neutral, None))
+                if len(group_entries) < judgment_group_totals[group_key]:
+                    return
+
+                keep_index = select_preferred_record_index(group_entries)
+                for idx, entry in enumerate(group_entries):
+                    r, fp, tp, rep, neu, err = entry
+                    if idx == keep_index:
+                        finalize_parsed_item(r, fp, tp, rep, neu, err)
+                    else:
+                        logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
+                        finalize_parsed_item(r, fp, tp, False, neu, None)
+                buffered_group_results.pop(group_key, None)
+
+            def reconcile_group_after_download_error(record: JudgmentRecord) -> None:
+                group_key = build_judgment_group_key(record)
+                if judgment_group_totals.get(group_key, 0) <= 1:
+                    return
+                judgment_group_totals[group_key] = max(0, judgment_group_totals[group_key] - 1)
+                group_entries = buffered_group_results.get(group_key, [])
+                if not group_entries:
+                    return
+                if len(group_entries) < judgment_group_totals[group_key]:
+                    return
+                keep_index = select_preferred_record_index(group_entries)
+                for idx, entry in enumerate(group_entries):
+                    r, fp, tp, rep, neu, err = entry
+                    if idx == keep_index:
+                        finalize_parsed_item(r, fp, tp, rep, neu, err)
+                    else:
+                        logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
+                        finalize_parsed_item(r, fp, tp, False, neu, None)
+                buffered_group_results.pop(group_key, None)
 
             if self.args.dry_run:
                 for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
@@ -456,9 +529,11 @@ class SciJudgmentScraper:
                         failed += 1
                         self.state.mark_failed(record, error)
                         self.write_failure(record, error)
+                        self.write_decision(record, "failed", f"download_error: {error}")
                         logging.error("Failed to download %s: %s", record.source_id, error)
+                        reconcile_group_after_download_error(record)
                     else:
-                        finalize_parsed_item(
+                        handle_analyzed_item(
                             record,
                             final_path,
                             temp_path,
@@ -476,7 +551,9 @@ class SciJudgmentScraper:
                             completed_items += 1
                             self.state.mark_failed(record, error)
                             self.write_failure(record, error)
+                            self.write_decision(record, "failed", f"download_error: {error}")
                             logging.error("Failed to download %s: %s", record.source_id, error)
+                            reconcile_group_after_download_error(record)
                             self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
                             continue
 
@@ -497,7 +574,7 @@ class SciJudgmentScraper:
                                         neutral,
                                         parse_error,
                                     ) = parsed_future.result()
-                                    finalize_parsed_item(
+                                    handle_analyzed_item(
                                         analyzed_record,
                                         default_final_path,
                                         analyzed_path,
@@ -506,7 +583,7 @@ class SciJudgmentScraper:
                                         parse_error,
                                     )
                                 except Exception as exc:
-                                    finalize_parsed_item(
+                                    handle_analyzed_item(
                                         default_record,
                                         default_final_path,
                                         default_temp_path,
@@ -527,7 +604,7 @@ class SciJudgmentScraper:
                                 neutral,
                                 parse_error,
                             ) = parsed_future.result()
-                            finalize_parsed_item(
+                            handle_analyzed_item(
                                 analyzed_record,
                                 default_final_path,
                                 analyzed_path,
@@ -536,7 +613,7 @@ class SciJudgmentScraper:
                                 parse_error,
                             )
                         except Exception as exc:
-                            finalize_parsed_item(
+                            handle_analyzed_item(
                                 default_record,
                                 default_final_path,
                                 default_temp_path,
@@ -546,6 +623,17 @@ class SciJudgmentScraper:
                             )
                         completed_items += 1
                         self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+
+            for group_entries in list(buffered_group_results.values()):
+                keep_index = select_preferred_record_index(group_entries)
+                for idx, entry in enumerate(group_entries):
+                    r, fp, tp, rep, neu, err = entry
+                    if idx == keep_index:
+                        finalize_parsed_item(r, fp, tp, rep, neu, err)
+                    else:
+                        logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
+                        finalize_parsed_item(r, fp, tp, False, neu, None)
+            buffered_group_results.clear()
 
             download_elapsed = time.perf_counter() - download_started_at
             if pending:
@@ -619,14 +707,8 @@ class SciJudgmentScraper:
     def should_keep_by_reportable_mode(self, record: JudgmentRecord) -> bool:
         if self.args.reportable_mode == "all":
             return True
-
-        if is_non_reportable_value(record.reportable_raw):
-            return False
-        if is_reportable_value(record.reportable_raw):
-            return True
-
-        if self.args.reportable_check == "metadata":
-            return False
+        # For reportable-only mode, keep all candidates and classify strictly from PDF text.
+        # Metadata can be inconsistent on SCI pages for older judgments.
         return True
 
     def iter_reportable_records(self, start_date: date, end_date: date) -> Iterator[JudgmentRecord]:
@@ -1246,6 +1328,12 @@ class SciJudgmentScraper:
                 ]
             )
 
+    def write_decision(self, record: JudgmentRecord, decision: str, reason: str) -> None:
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self.decision_log_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp, record.source_id, record.pdf_url, decision, reason])
+
     def write_run_manifest(
         self,
         *,
@@ -1563,15 +1651,23 @@ def extract_pdf_text(pdf_path: Path, max_pages: int = 2) -> str:
 
 
 def is_pdf_reportable(pdf_path: Path) -> bool:
-    text = extract_pdf_text(pdf_path)
+    text = extract_pdf_text(pdf_path, max_pages=5)
     if not text:
         return False
     lower = text.lower()
 
-    # Reject any explicit non-reportable marker, including hyphenated variants.
-    if re.search(r"\bnon\s*[-]?\s*reportable\b", lower):
+    # Reject any explicit non-reportable marker (handles broken spacing/encoding in extracted PDF text).
+    if has_relaxed_token(lower, "nonreportable"):
         return False
-    return bool(re.search(r"\breportable\b", lower))
+    return has_relaxed_token(lower, "reportable")
+
+
+def has_relaxed_token(text: str, token: str) -> bool:
+    letters = [re.escape(ch) for ch in token.lower() if ch.isalnum()]
+    if not letters:
+        return False
+    pattern = r"".join([letters[0]] + [rf"[\W_]*{ch}" for ch in letters[1:]])
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
 def extract_neutral_citation_from_pdf(pdf_path: Path) -> Optional[str]:
@@ -1647,6 +1743,7 @@ def parse_json_record(raw: Dict[str, object]) -> Optional[JudgmentRecord]:
         bench=pick_str(raw, ["bench", "coram", "judges"]),
         citation=pick_str(raw, ["citation", "neutral_citation"]),
         reportable_raw=reportable_raw,
+        pdf_label=pick_str(raw, ["pdf_label", "label", "link_text"]),
     )
 
 
@@ -1662,35 +1759,21 @@ def pick_str(data: Dict[str, object], keys: List[str]) -> Optional[str]:
 def parse_html_candidates(soup: BeautifulSoup, base_url: str) -> List[JudgmentRecord]:
     records: List[JudgmentRecord] = []
 
-    for link in soup.select("a[href]"):
-        href = link.get("href")
+    rows = soup.select("tr")
+    for row in rows:
+        preferred_link = choose_preferred_row_link(row, base_url)
+        if preferred_link is None:
+            continue
+
+        href = preferred_link.get("href")
         if not href:
             continue
         absolute = urljoin(base_url, href)
-        link_text = " ".join(link.stripped_strings)
-        lowered_url = absolute.lower()
-        lowered_text = link_text.lower()
-        if not (
-            "pdf" in lowered_url
-            or "view-pdf" in lowered_url
-            or "judgment" in lowered_text
-            or "judgement" in lowered_text
-            or "download" in lowered_text
-            or "pdf" in lowered_text
-        ):
-            continue
+        link_text = " ".join(preferred_link.stripped_strings)
+        row_text = row.get_text(" ", strip=True)
+        row_fields = extract_search_row_fields(row)
 
-        row = link.find_parent("tr")
-        if row is not None:
-            row_text = row.get_text(" ", strip=True)
-            row_fields = extract_search_row_fields(row)
-        else:
-            row_text = link.parent.get_text(" ", strip=True) if link.parent else link_text
-            row_fields = {}
-
-        maybe_date = extract_first_date(row_text)
-        if not maybe_date:
-            maybe_date = extract_date_from_pdf_url(absolute)
+        maybe_date = extract_first_date(row_text) or extract_date_from_pdf_url(absolute)
         if not maybe_date:
             continue
 
@@ -1713,10 +1796,94 @@ def parse_html_candidates(soup: BeautifulSoup, base_url: str) -> List[JudgmentRe
                 bench=row_fields.get("bench") or extract_value_after_label(row_text, ["bench", "coram"]),
                 citation=extract_value_after_label(row_text, ["citation", "neutral citation"]),
                 reportable_raw=reportable_raw,
+                pdf_label=link_text,
+            )
+        )
+
+    # Fallback for non-table layouts: parse standalone links with same preference rules.
+    if records:
+        return records
+    for link in soup.select("a[href]"):
+        href = link.get("href")
+        if not href:
+            continue
+        absolute = urljoin(base_url, href)
+        link_text = " ".join(link.stripped_strings)
+        if not is_candidate_judgment_link(absolute, link_text):
+            continue
+        if not is_english_link_text(link_text):
+            continue
+        row_text = link.parent.get_text(" ", strip=True) if link.parent else link_text
+        maybe_date = extract_first_date(row_text) or extract_date_from_pdf_url(absolute)
+        if not maybe_date:
+            continue
+        case_title = extract_case_title(row_text)
+        source_id = build_source_id_from_html(absolute, case_title, maybe_date)
+        reportable_raw = infer_reportable_status(row_text, link_text)
+        records.append(
+            JudgmentRecord(
+                source_id=source_id,
+                case_title=case_title,
+                judgment_date=maybe_date,
+                pdf_url=absolute,
+                detail_url=absolute,
+                reportable_raw=reportable_raw,
+                pdf_label=link_text,
             )
         )
 
     return records
+
+
+def is_candidate_judgment_link(absolute_url: str, link_text: str) -> bool:
+    lowered_url = absolute_url.lower()
+    lowered_text = link_text.lower()
+    return bool(
+        "pdf" in lowered_url
+        or "view-pdf" in lowered_url
+        or "judgment" in lowered_text
+        or "judgement" in lowered_text
+        or "download" in lowered_text
+        or "pdf" in lowered_text
+        or "insc" in lowered_text
+    )
+
+
+def choose_preferred_row_link(row: BeautifulSoup, base_url: str) -> Optional[BeautifulSoup]:
+    candidates: List[BeautifulSoup] = []
+    for candidate in row.select("a[href]"):
+        href = candidate.get("href")
+        if not href:
+            continue
+        absolute = urljoin(base_url, href)
+        text = " ".join(candidate.stripped_strings)
+        if is_candidate_judgment_link(absolute, text) and is_english_link_text(text):
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    best = max(
+        candidates,
+        key=lambda c: score_row_link_choice(
+            " ".join(c.stripped_strings),
+            urljoin(base_url, c.get("href") or ""),
+        ),
+    )
+    return best
+
+
+def score_row_link_choice(link_text: str, absolute_url: str) -> Tuple[int, int, int, int, int]:
+    lower_text = link_text.lower()
+    lower_url = absolute_url.lower()
+    has_neutral_label = 1 if re.search(r"\b(20\d{2})\s+insc\s+\d{2,4}\b", lower_text) else 0
+    is_english = 1 if ("english" in lower_text or "lang=en" in lower_url or "_en" in lower_url) else 0
+    has_date_label = 1 if re.search(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b", lower_text) else 0
+    has_pdf_hint = 1 if ("pdf" in lower_text or "pdf" in lower_url or "view-pdf" in lower_url) else 0
+    # Prefer neutral-label link first; then English; then date label fallback.
+    return (has_neutral_label, is_english, has_date_label, has_pdf_hint, -len(absolute_url))
+
+
+def is_english_link_text(link_text: str) -> bool:
+    return "(english" in link_text.lower()
 
 
 def extract_first_date(text: str) -> Optional[date]:
@@ -1808,6 +1975,91 @@ def normalize_ws(value: str) -> str:
 def build_source_id_from_html(pdf_url: str, case_title: str, judgment_date: date) -> str:
     key = f"{pdf_url}|{case_title}|{judgment_date.isoformat()}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
+
+
+def build_judgment_group_key(record: JudgmentRecord) -> str:
+    party = normalize_ws(record.petitioner_respondent or record.case_title).lower()
+    diary = normalize_ws(record.diary_number or "").lower()
+    case_no = normalize_ws(record.case_number or "").lower()
+    # Keep grouping stable across variants (date-link PDF vs INSC-link PDF) and detail/listing mixes.
+    # Bench/judgment_by often vary in formatting and may split the same judgment into separate groups.
+    return "|".join(
+        [
+            record.judgment_date.isoformat(),
+            diary,
+            case_no,
+            party,
+        ]
+    )
+
+
+def is_probably_english_record(record: JudgmentRecord) -> bool:
+    text = " ".join(
+        [
+            record.pdf_url or "",
+            record.pdf_label or "",
+            record.case_title or "",
+            record.petitioner_respondent or "",
+            record.citation or "",
+        ]
+    ).lower()
+    if any(token in text for token in ["english", "_en", "-en", "lang=en"]):
+        return True
+    if any(
+        token in text
+        for token in [
+            "hindi",
+            "urdu",
+            "tamil",
+            "telugu",
+            "kannada",
+            "malayalam",
+            "marathi",
+            "gujarati",
+            "punjabi",
+            "bengali",
+            "odia",
+            "assamese",
+        ]
+    ):
+        return False
+    return True
+
+
+def select_preferred_record_index(
+    entries: List[Tuple[JudgmentRecord, Path, Path, bool, Optional[str], Optional[str]]]
+) -> int:
+    best_index = 0
+    best_score = (-1, -1, -1, -1, 0)
+    for i, (record, _, _, is_reportable, neutral, error) in enumerate(entries):
+        has_error = bool(error)
+        has_neutral_link_label = extract_neutral_citation_from_text(record.pdf_label or "") is not None
+        has_neutral = bool(neutral) or has_neutral_link_label
+        if not has_neutral and record.citation:
+            has_neutral = extract_neutral_citation_from_text(record.citation) is not None
+        score = (
+            0 if has_error else 1,
+            1 if is_reportable else 0,
+            1 if has_neutral_link_label else 0,
+            1 if has_neutral else 0,
+            1 if is_probably_english_record(record) else 0,
+            -len(record.pdf_url or ""),
+        )
+        if score > best_score:
+            best_score = score
+            best_index = i
+    return best_index
+
+
+def score_record_for_pre_download_selection(record: JudgmentRecord) -> Tuple[int, int, int, int]:
+    label = record.pdf_label or ""
+    citation = record.citation or ""
+    url = record.pdf_url or ""
+    has_neutral_label = 1 if extract_neutral_citation_from_text(label) else 0
+    has_neutral_any = 1 if (has_neutral_label or extract_neutral_citation_from_text(citation)) else 0
+    english_hint = 1 if is_probably_english_record(record) else 0
+    # Prefer canonical/shorter links in total ties.
+    return (has_neutral_label, has_neutral_any, english_hint, -len(url))
 
 
 def extract_value_after_label(text: str, labels: List[str]) -> Optional[str]:

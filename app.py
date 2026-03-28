@@ -721,14 +721,18 @@ def render_outputs() -> None:
     internal_data_dir = pathlib.Path(output_dir) / INTERNAL_DATA_DIR_NAME
     metadata_file = internal_data_dir / "metadata.csv"
     failed_file = internal_data_dir / "failed_downloads.csv"
+    decision_file = internal_data_dir / "decision_log.csv"
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     if metadata_file.exists():
         with metadata_file.open("rb") as f:
             col1.download_button("Download metadata.csv", data=f.read(), file_name="metadata.csv")
     if failed_file.exists():
         with failed_file.open("rb") as f:
             col2.download_button("Download failed_downloads.csv", data=f.read(), file_name="failed_downloads.csv")
+    if decision_file.exists():
+        with decision_file.open("rb") as f:
+            col3.download_button("Download decision_log.csv", data=f.read(), file_name="decision_log.csv")
 
 
 def render_logs() -> None:
