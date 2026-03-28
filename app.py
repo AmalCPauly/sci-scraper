@@ -132,6 +132,7 @@ def ensure_state() -> None:
     state.setdefault("date_mode", "Month")
     state.setdefault("ui_mode", "Simple")
     state.setdefault("ui_mode_toggle", state.get("ui_mode", "Simple") == "Advanced")
+    state.setdefault("prev_ui_mode_toggle", state.get("ui_mode_toggle", False))
     state.setdefault("month_year_value", date.today().year)
     state.setdefault("month_number_value", date.today().month)
     state.setdefault("year_value", date.today().year)
@@ -410,12 +411,22 @@ def drain_events() -> bool:
 def render_sidebar() -> None:
     st.sidebar.header("Run Options")
     today = date.today()
+    previous_advanced = bool(st.session_state.get("prev_ui_mode_toggle", False))
     st.sidebar.toggle(
         "Advanced mode",
         key="ui_mode_toggle",
         disabled=st.session_state.run_active,
     )
-    st.session_state.ui_mode = "Advanced" if st.session_state.ui_mode_toggle else "Simple"
+    current_advanced = bool(st.session_state.ui_mode_toggle)
+    st.session_state.ui_mode = "Advanced" if current_advanced else "Simple"
+    if previous_advanced and not current_advanced:
+        # Revert hidden advanced settings back to simple-mode defaults.
+        st.session_state.download_workers = 16
+        st.session_state.reportable_mode = "reportable"
+        st.session_state.reportable_check = "pdf"
+        st.session_state.log_level = "INFO"
+        st.session_state.keep_run_diagnostics = False
+    st.session_state.prev_ui_mode_toggle = current_advanced
 
     st.sidebar.radio(
         "Date filter",
