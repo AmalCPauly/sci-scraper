@@ -188,11 +188,13 @@ class SciJudgmentScraper:
         captcha_provider: Optional[Callable[[Path, str], str]] = None,
         progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
         enable_terminal_progress: bool = True,
+        stop_event: Optional[object] = None,
     ) -> None:
         self.args = args
         self.captcha_provider = captcha_provider
         self.progress_callback = progress_callback
         self.enable_terminal_progress = enable_terminal_progress
+        self.stop_event = stop_event
         self.output_dir = Path(args.output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.internal_data_dir = self.output_dir / INTERNAL_DATA_DIR_NAME
@@ -283,9 +285,19 @@ class SciJudgmentScraper:
                 writer.writerow(["timestamp", "source_id", "pdf_url", "decision", "reason"])
 
     def _sleep_if_needed(self) -> None:
+        self._check_stop_requested()
         elapsed = time.time() - self.last_request_at
         if elapsed < self.args.min_interval:
             time.sleep(self.args.min_interval - elapsed)
+
+    def _check_stop_requested(self) -> None:
+        if self.stop_event is None:
+            return
+        try:
+            if bool(self.stop_event.is_set()):
+                raise KeyboardInterrupt("Stopped by user")
+        except AttributeError:
+            return
 
     def _allowed_by_robots(self, url: str) -> bool:
         if not self.args.respect_robots:
@@ -301,6 +313,7 @@ class SciJudgmentScraper:
             return True
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        self._check_stop_requested()
         if not self._allowed_by_robots(url):
             raise PermissionError(f"Blocked by robots.txt: {url}")
 
@@ -310,6 +323,7 @@ class SciJudgmentScraper:
         attempt = 0
         did_403_recovery = False
         while True:
+            self._check_stop_requested()
             attempt += 1
             try:
                 self._sleep_if_needed()
@@ -1012,6 +1026,7 @@ class SciJudgmentScraper:
         return self.staging_dir / filename
 
     def download_record(self, record: JudgmentRecord, file_path: Optional[Path] = None) -> Tuple[Path, float]:
+        self._check_stop_requested()
         if file_path is None:
             file_path = self.build_download_path(record)
         started_at = time.perf_counter()
@@ -1028,6 +1043,7 @@ class SciJudgmentScraper:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with file_path.open("wb") as f:
             for chunk in response.iter_content(chunk_size=1024 * 64):
+                self._check_stop_requested()
                 if chunk:
                     f.write(chunk)
         return file_path, time.perf_counter() - started_at
@@ -1397,6 +1413,7 @@ class SciJudgmentScraper:
             pass
 
     def _download_request(self, url: str, **kwargs) -> requests.Response:
+        self._check_stop_requested()
         if not self._allowed_by_robots(url):
             raise PermissionError(f"Blocked by robots.txt: {url}")
 
@@ -1404,6 +1421,7 @@ class SciJudgmentScraper:
             session.headers.update(self.session.headers)
             attempt = 0
             while True:
+                self._check_stop_requested()
                 attempt += 1
                 try:
                     response = session.request("GET", url, timeout=self.args.timeout, **kwargs)

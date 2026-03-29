@@ -58,11 +58,13 @@ class FrontendRunBridge:
         self.event_queue: Queue = Queue()
         self.answer_event = threading.Event()
         self.answer_lock = threading.Lock()
+        self.stop_event = threading.Event()
         self.pending_answer = ""
         self.thread: Optional[threading.Thread] = None
         self.running = False
 
     def start(self, args) -> None:
+        self.stop_event.clear()
         self.running = True
         self.thread = threading.Thread(target=self._run_worker, args=(args,), daemon=True)
         self.thread.start()
@@ -85,9 +87,13 @@ class FrontendRunBridge:
                 captcha_provider=self.captcha_provider,
                 progress_callback=self.progress_callback,
                 enable_terminal_progress=False,
+                stop_event=self.stop_event,
             )
             summary = scraper.run()
             self.event_queue.put({"type": "complete", "summary": summary})
+        except KeyboardInterrupt as exc:
+            logging.info("Frontend run stopped: %s", exc)
+            self.event_queue.put({"type": "stopped", "message": str(exc) or "Stopped by user"})
         except Exception as exc:
             logging.exception("Frontend run failed: %s", exc)
             self.event_queue.put({"type": "error", "message": str(exc)})
@@ -114,6 +120,11 @@ class FrontendRunBridge:
         with self.answer_lock:
             self.pending_answer = answer
         self.answer_event.set()
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+        # If worker is waiting for CAPTCHA input, unblock it immediately.
+        self.submit_answer("q")
 
     def progress_callback(self, payload: Dict[str, Any]) -> None:
         self.event_queue.put({"type": "progress", "payload": payload})
@@ -175,6 +186,7 @@ def ensure_state() -> None:
     state.setdefault("confirm_stop_exit", False)
     state.setdefault("confirm_exit_app", False)
     state.setdefault("stop_notice", False)
+    state.setdefault("stopping_run", False)
     state.setdefault("exit_requested", False)
     state.setdefault("exit_cleanup_count", 0)
     state.setdefault("show_success_banner", False)
@@ -432,13 +444,26 @@ def drain_events() -> bool:
                 "average_per_processed_seconds": event["summary"].average_per_processed_seconds,
             }
             st.session_state.run_active = False
+            st.session_state.stopping_run = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
             st.session_state.show_success_banner = event["summary"].failed == 0
             needs_full_rerun = True
+        elif event["type"] == "stopped":
+            st.session_state.run_active = False
+            st.session_state.stopping_run = False
+            st.session_state.captcha = None
+            st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.show_success_banner = False
+            st.session_state.stop_notice = True
+            st.session_state.exit_cleanup_count = cleanup_partial_downloads(
+                st.session_state.get("active_output_dir", resolve_run_output_dir())
+            )
+            needs_full_rerun = True
         elif event["type"] == "error":
             st.session_state.error_message = event["message"]
             st.session_state.run_active = False
+            st.session_state.stopping_run = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
             st.session_state.show_success_banner = False
@@ -658,12 +683,15 @@ def render_sidebar() -> None:
             st.session_state.has_started_run = True
             st.session_state.confirm_stop_exit = False
             st.session_state.stop_notice = False
+            st.session_state.stopping_run = False
             st.session_state.exit_cleanup_count = 0
             st.session_state.show_success_banner = False
             bridge.start(build_ui_args())
             st.rerun()
     else:
-        if not st.session_state.get("confirm_stop_exit", False):
+        if st.session_state.get("stopping_run", False):
+            st.sidebar.info("Stopping download...")
+        elif not st.session_state.get("confirm_stop_exit", False):
             if st.sidebar.button("Stop Download"):
                 st.session_state.confirm_stop_exit = True
                 st.rerun()
@@ -674,16 +702,11 @@ def render_sidebar() -> None:
                 bridge = st.session_state.get("bridge")
                 if bridge is not None:
                     try:
-                        bridge.submit_answer("q")
+                        bridge.request_stop()
                     except Exception:
                         pass
-                st.session_state.exit_cleanup_count = cleanup_partial_downloads(
-                    st.session_state.get("active_output_dir", resolve_run_output_dir())
-                )
-                st.session_state.run_active = False
-                st.session_state.captcha = None
+                st.session_state.stopping_run = True
                 st.session_state.confirm_stop_exit = False
-                st.session_state.stop_notice = True
                 st.rerun()
             if col2.button("Cancel"):
                 st.session_state.confirm_stop_exit = False
