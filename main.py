@@ -358,6 +358,10 @@ class SciJudgmentScraper:
             start_date, end_date = resolve_date_range(self.args)
             logging.info("Target date range: %s to %s", start_date, end_date)
             self._prepare_chunk_resume_state(start_date, end_date)
+            if self.args.human_captcha:
+                self.emit_phase("Solving CAPTCHAs")
+            else:
+                self.emit_phase("Downloading PDFs")
 
             processed = 0
             downloaded = 0
@@ -1064,6 +1068,7 @@ class SciJudgmentScraper:
     ) -> Tuple[int, int, int, float, float]:
         if not pending:
             return downloaded, skipped, failed, 0.0, 0.0
+        self.emit_phase("Downloading PDFs")
 
         logging.info(
             "Prepared %s judgments for download using %s download worker(s) and %s parse worker(s)",
@@ -1305,6 +1310,10 @@ class SciJudgmentScraper:
         batch_parse_elapsed = time.perf_counter() - parse_started_at
         self.safe_stdout_write("\n")
         return downloaded, skipped, failed, batch_download_elapsed, batch_parse_elapsed
+
+    def emit_phase(self, phase: str) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback({"event": "phase", "phase": phase})
 
     def _analyze_single_download(
         self, record: JudgmentRecord, temp_path: Path

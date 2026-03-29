@@ -137,7 +137,10 @@ def ensure_state() -> None:
     state = st.session_state
     state.setdefault("bridge", None)
     state.setdefault("logs", [])
-    state.setdefault("progress", {"completed": 0, "total": 0, "downloaded": 0, "skipped": 0, "failed": 0})
+    state.setdefault(
+        "progress",
+        {"completed": 0, "total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "phase": "Waiting to start"},
+    )
     state.setdefault("captcha", None)
     state.setdefault("summary", None)
     state.setdefault("run_active", False)
@@ -176,6 +179,7 @@ def ensure_state() -> None:
     state.setdefault("exit_cleanup_count", 0)
     state.setdefault("show_success_banner", False)
     state.setdefault("show_output_folder_fallback", False)
+    state.setdefault("phase_dot_count", 0)
 
 
 def cleanup_partial_downloads(output_dir: str) -> int:
@@ -398,7 +402,15 @@ def drain_events() -> bool:
         elif event["type"] == "progress":
             payload = event["payload"]
             if payload.get("event") == "progress":
-                st.session_state.progress = payload
+                current = dict(st.session_state.get("progress", {}))
+                merged = dict(payload)
+                if "phase" not in merged:
+                    merged["phase"] = current.get("phase", "")
+                st.session_state.progress = merged
+            elif payload.get("event") == "phase":
+                current = dict(st.session_state.get("progress", {}))
+                current["phase"] = str(payload.get("phase", "")).strip() or current.get("phase", "")
+                st.session_state.progress = current
             elif payload.get("event") == "summary":
                 st.session_state.summary = payload
             elif payload.get("event") == "captcha_progress":
@@ -630,7 +642,14 @@ def render_sidebar() -> None:
             bridge = FrontendRunBridge()
             st.session_state.bridge = bridge
             st.session_state.logs = []
-            st.session_state.progress = {"completed": 0, "total": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+            st.session_state.progress = {
+                "completed": 0,
+                "total": 0,
+                "downloaded": 0,
+                "skipped": 0,
+                "failed": 0,
+                "phase": "Solving CAPTCHAs",
+            }
             st.session_state.summary = None
             st.session_state.captcha = None
             st.session_state.error_message = ""
@@ -698,6 +717,11 @@ def render_status() -> None:
     summary = st.session_state.summary
     if not summary:
         st.subheader("Progress")
+        phase = str(progress.get("phase", "")).strip()
+        if phase:
+            st.session_state.phase_dot_count = (int(st.session_state.get("phase_dot_count", 0)) % 3) + 1
+            dot_count = int(st.session_state.phase_dot_count)
+            st.caption(f"{phase}{'.' * dot_count}")
         st.progress(ratio, text=f"{completed} / {total} completed" if total else "Waiting to start")
 
         col1, col2, col3, col4 = st.columns(4)
