@@ -142,6 +142,10 @@ def ensure_state() -> None:
     state.setdefault("reportable_mode", "reportable")
     state.setdefault("reportable_check", "pdf")
     state.setdefault("keep_run_diagnostics", False)
+    state.setdefault("captcha_solve_mode", "solve_all_first")
+    state.setdefault("captcha_batch_size", 5)
+    if state.get("captcha_solve_mode") not in {"inline", "solve_all_first", "solve_in_batches"}:
+        state["captcha_solve_mode"] = "solve_all_first"
     state.setdefault("log_level", "INFO")
     state.setdefault("has_started_run", False)
     state.setdefault("startup_checks", None)
@@ -186,6 +190,8 @@ def build_ui_args() -> Any:
     args.reportable_mode = st.session_state.reportable_mode
     args.reportable_check = st.session_state.reportable_check
     args.keep_run_diagnostics = bool(st.session_state.get("keep_run_diagnostics", False))
+    args.captcha_solve_mode = str(st.session_state.get("captcha_solve_mode", "solve_all_first"))
+    args.captcha_batch_size = int(st.session_state.get("captcha_batch_size", 5))
     args.log_level = st.session_state.log_level
 
     mode = st.session_state.date_mode
@@ -426,6 +432,8 @@ def render_sidebar() -> None:
         st.session_state.reportable_check = "pdf"
         st.session_state.log_level = "INFO"
         st.session_state.keep_run_diagnostics = False
+        st.session_state.captcha_solve_mode = "solve_all_first"
+        st.session_state.captcha_batch_size = 5
     st.session_state.prev_ui_mode_toggle = current_advanced
 
     st.sidebar.radio(
@@ -559,6 +567,22 @@ def render_sidebar() -> None:
             disabled=st.session_state.run_active,
             help="When enabled, stores per-run manifest JSON files for troubleshooting.",
         )
+        st.sidebar.selectbox(
+            "CAPTCHA interaction",
+            ["solve_all_first", "inline", "solve_in_batches"],
+            key="captcha_solve_mode",
+            disabled=st.session_state.run_active,
+            help="Choose whether to solve CAPTCHA per chunk, upfront for all chunks, or in batches.",
+        )
+        if st.session_state.captcha_solve_mode == "solve_in_batches":
+            st.sidebar.number_input(
+                "CAPTCHA batch size",
+                min_value=1,
+                max_value=30,
+                step=1,
+                key="captcha_batch_size",
+                disabled=st.session_state.run_active,
+            )
 
     if validation_error:
         st.sidebar.error(validation_error)

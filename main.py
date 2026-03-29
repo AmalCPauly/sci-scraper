@@ -372,26 +372,29 @@ class SciJudgmentScraper:
             run_started_at = time.perf_counter()
             run_started_iso = datetime.now().isoformat(timespec="seconds")
             discovery_started_at = time.perf_counter()
+            solve_mode = str(getattr(self.args, "captcha_solve_mode", "solve_all_first"))
+            chunked_runtime_mode = bool(self.args.human_captcha and solve_mode in {"inline", "solve_in_batches"})
 
-            for record in self.iter_reportable_records(start_date, end_date):
-                if not self.should_keep_by_reportable_mode(record):
+            if not chunked_runtime_mode:
+                for record in self.iter_reportable_records(start_date, end_date):
+                    if not self.should_keep_by_reportable_mode(record):
+                        skipped += 1
+                        self.write_decision(record, "skipped", "filtered_before_download")
+                        continue
+                    dedupe_key = build_pre_download_group_key(record)
+                    if dedupe_key is None:
+                        selected_unique.append(record)
+                        continue
+                    existing = selected_by_key.get(dedupe_key)
+                    if existing is None:
+                        selected_by_key[dedupe_key] = record
+                        continue
+                    if score_record_for_pre_download_selection(record) > score_record_for_pre_download_selection(existing):
+                        self.write_decision(existing, "skipped", "duplicate_variant_preferred_other")
+                        selected_by_key[dedupe_key] = record
+                    else:
+                        self.write_decision(record, "skipped", "duplicate_variant_lower_priority")
                     skipped += 1
-                    self.write_decision(record, "skipped", "filtered_before_download")
-                    continue
-                dedupe_key = build_pre_download_group_key(record)
-                if dedupe_key is None:
-                    selected_unique.append(record)
-                    continue
-                existing = selected_by_key.get(dedupe_key)
-                if existing is None:
-                    selected_by_key[dedupe_key] = record
-                    continue
-                if score_record_for_pre_download_selection(record) > score_record_for_pre_download_selection(existing):
-                    self.write_decision(existing, "skipped", "duplicate_variant_preferred_other")
-                    selected_by_key[dedupe_key] = record
-                else:
-                    self.write_decision(record, "skipped", "duplicate_variant_lower_priority")
-                skipped += 1
 
             discovery_elapsed = time.perf_counter() - discovery_started_at
             selected_records = selected_unique + list(selected_by_key.values())
@@ -411,255 +414,72 @@ class SciJudgmentScraper:
             if needs_pdf_runtime:
                 self.ensure_pdf_runtime_ready()
 
-            if pending:
-                logging.info(
-                    "Prepared %s judgments for download using %s download worker(s) and %s parse worker(s)",
-                    len(pending),
-                    self.args.download_workers,
-                    self.args.parse_workers,
-                )
-                self.print_progress(0, len(pending), 0, 0, 0)
-
-            download_started_at = time.perf_counter()
-            parse_started_at = time.perf_counter()
-            completed_items = 0
-            judgment_group_totals: Dict[str, int] = {}
-            for rec, _, _ in pending:
-                group_key = build_judgment_group_key(rec)
-                judgment_group_totals[group_key] = judgment_group_totals.get(group_key, 0) + 1
-            buffered_group_results: Dict[
-                str, List[Tuple[JudgmentRecord, Path, Path, bool, Optional[str], Optional[str]]]
-            ] = {}
-
-            def finalize_parsed_item(
-                record: JudgmentRecord,
-                final_path: Path,
-                temp_path: Path,
-                is_reportable: bool,
-                neutral: Optional[str],
-                error: Optional[str],
-            ) -> None:
-                nonlocal downloaded, skipped, failed
-                try:
-                    if error:
-                        failed += 1
-                        self.state.mark_failed(record, error)
-                        self.write_failure(record, error)
-                        self.write_decision(record, "failed", f"analyze_error: {error}")
-                        logging.error("Failed to analyze %s: %s", record.source_id, error)
-                        try:
-                            temp_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        return
-
-                    if self.args.dry_run:
-                        is_reportable = True
-
-                    if self.args.reportable_mode == "reportable" and not is_reportable:
-                        skipped += 1
-                        self.write_decision(record, "skipped", "pdf_not_reportable")
-                        try:
-                            temp_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        return
-
-                    if self.args.dry_run:
-                        local_path = final_path
-                    else:
-                        temp_path.replace(final_path)
-                        local_path = final_path
-
-                    if neutral:
-                        record.neutral_citation = neutral
-                        local_path = self.rename_with_neutral_citation(local_path, neutral)
-
-                    self.state.mark_downloaded(record, local_path)
-                    self.write_metadata(record, local_path)
-                    self.write_decision(record, "downloaded", "ok")
-                    downloaded += 1
-                except Exception as exc:
-                    failed += 1
-                    self.state.mark_failed(record, str(exc))
-                    self.write_failure(record, str(exc))
-                    self.write_decision(record, "failed", f"finalize_error: {exc}")
-                    logging.exception("Failed to finalize %s", record.source_id)
-                    try:
-                        temp_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-            def handle_analyzed_item(
-                record: JudgmentRecord,
-                final_path: Path,
-                temp_path: Path,
-                is_reportable: bool,
-                neutral: Optional[str],
-                error: Optional[str],
-            ) -> None:
-                if error:
-                    finalize_parsed_item(record, final_path, temp_path, is_reportable, neutral, error)
-                    return
-
-                group_key = build_judgment_group_key(record)
-                if judgment_group_totals.get(group_key, 0) <= 1:
-                    finalize_parsed_item(record, final_path, temp_path, is_reportable, neutral, None)
-                    return
-
-                group_entries = buffered_group_results.setdefault(group_key, [])
-                group_entries.append((record, final_path, temp_path, is_reportable, neutral, None))
-                if len(group_entries) < judgment_group_totals[group_key]:
-                    return
-
-                keep_index = select_preferred_record_index(group_entries)
-                for idx, entry in enumerate(group_entries):
-                    r, fp, tp, rep, neu, err = entry
-                    if idx == keep_index:
-                        finalize_parsed_item(r, fp, tp, rep, neu, err)
-                    else:
-                        logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
-                        finalize_parsed_item(r, fp, tp, False, neu, None)
-                buffered_group_results.pop(group_key, None)
-
-            def reconcile_group_after_download_error(record: JudgmentRecord) -> None:
-                group_key = build_judgment_group_key(record)
-                if judgment_group_totals.get(group_key, 0) <= 1:
-                    return
-                judgment_group_totals[group_key] = max(0, judgment_group_totals[group_key] - 1)
-                group_entries = buffered_group_results.get(group_key, [])
-                if not group_entries:
-                    return
-                if len(group_entries) < judgment_group_totals[group_key]:
-                    return
-                keep_index = select_preferred_record_index(group_entries)
-                for idx, entry in enumerate(group_entries):
-                    r, fp, tp, rep, neu, err = entry
-                    if idx == keep_index:
-                        finalize_parsed_item(r, fp, tp, rep, neu, err)
-                    else:
-                        logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
-                        finalize_parsed_item(r, fp, tp, False, neu, None)
-                buffered_group_results.pop(group_key, None)
-
-            if self.args.dry_run:
-                for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
-                    completed_items += 1
-                    if error:
-                        failed += 1
-                        self.state.mark_failed(record, error)
-                        self.write_failure(record, error)
-                        self.write_decision(record, "failed", f"download_error: {error}")
-                        logging.error("Failed to download %s: %s", record.source_id, error)
-                        reconcile_group_after_download_error(record)
-                    else:
-                        handle_analyzed_item(
-                            record,
-                            final_path,
-                            temp_path,
-                            True,
-                            record.neutral_citation,
-                            None,
-                        )
-                    self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
-            else:
-                parse_futures = {}
-                with ThreadPoolExecutor(max_workers=self.args.parse_workers) as parse_executor:
-                    for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
-                        if error:
-                            failed += 1
-                            completed_items += 1
-                            self.state.mark_failed(record, error)
-                            self.write_failure(record, error)
-                            self.write_decision(record, "failed", f"download_error: {error}")
-                            logging.error("Failed to download %s: %s", record.source_id, error)
-                            reconcile_group_after_download_error(record)
-                            self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+            download_elapsed = 0.0
+            parse_elapsed = 0.0
+            if chunked_runtime_mode:
+                # Re-run discovery in chunked form so download happens between CAPTCHA interactions.
+                processed = 0
+                downloaded = 0
+                skipped = 0
+                failed = 0
+                selected_by_key = {}
+                selected_unique = []
+                reserved_paths = set()
+                self._run_chunk_stats = []
+                self._run_failures = []
+                discovery_started_at = time.perf_counter()
+                for batch_records in self._iter_human_captcha_record_batches(start_date, end_date):
+                    selected_by_key.clear()
+                    selected_unique.clear()
+                    for record in batch_records:
+                        if not self.should_keep_by_reportable_mode(record):
+                            skipped += 1
+                            self.write_decision(record, "skipped", "filtered_before_download")
                             continue
+                        dedupe_key = build_pre_download_group_key(record)
+                        if dedupe_key is None:
+                            selected_unique.append(record)
+                            continue
+                        existing = selected_by_key.get(dedupe_key)
+                        if existing is None:
+                            selected_by_key[dedupe_key] = record
+                            continue
+                        if score_record_for_pre_download_selection(record) > score_record_for_pre_download_selection(existing):
+                            self.write_decision(existing, "skipped", "duplicate_variant_preferred_other")
+                            selected_by_key[dedupe_key] = record
+                        else:
+                            self.write_decision(record, "skipped", "duplicate_variant_lower_priority")
+                        skipped += 1
 
-                        future = parse_executor.submit(self._analyze_single_download, record, temp_path)
-                        parse_futures[future] = (record, final_path, temp_path)
+                    selected_records = selected_unique + list(selected_by_key.values())
+                    selected_records.sort(
+                        key=lambda r: (r.judgment_date.isoformat(), normalize_ws(r.case_title).lower(), r.source_id)
+                    )
+                    processed += len(selected_records)
 
-                        while parse_futures:
-                            done, _ = wait(set(parse_futures.keys()), timeout=0, return_when=FIRST_COMPLETED)
-                            if not done:
-                                break
-                            for parsed_future in done:
-                                default_record, default_final_path, default_temp_path = parse_futures.pop(parsed_future)
-                                try:
-                                    (
-                                        analyzed_record,
-                                        analyzed_path,
-                                        is_reportable,
-                                        neutral,
-                                        parse_error,
-                                    ) = parsed_future.result()
-                                    handle_analyzed_item(
-                                        analyzed_record,
-                                        default_final_path,
-                                        analyzed_path,
-                                        is_reportable,
-                                        neutral,
-                                        parse_error,
-                                    )
-                                except Exception as exc:
-                                    handle_analyzed_item(
-                                        default_record,
-                                        default_final_path,
-                                        default_temp_path,
-                                        False,
-                                        None,
-                                        str(exc),
-                                    )
-                                completed_items += 1
-                                self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
-
-                    for parsed_future in as_completed(list(parse_futures.keys())):
-                        default_record, default_final_path, default_temp_path = parse_futures.pop(parsed_future)
-                        try:
-                            (
-                                analyzed_record,
-                                analyzed_path,
-                                is_reportable,
-                                neutral,
-                                parse_error,
-                            ) = parsed_future.result()
-                            handle_analyzed_item(
-                                analyzed_record,
-                                default_final_path,
-                                analyzed_path,
-                                is_reportable,
-                                neutral,
-                                parse_error,
-                            )
-                        except Exception as exc:
-                            handle_analyzed_item(
-                                default_record,
-                                default_final_path,
-                                default_temp_path,
-                                False,
-                                None,
-                                str(exc),
-                            )
-                        completed_items += 1
-                        self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
-
-            for group_entries in list(buffered_group_results.values()):
-                keep_index = select_preferred_record_index(group_entries)
-                for idx, entry in enumerate(group_entries):
-                    r, fp, tp, rep, neu, err = entry
-                    if idx == keep_index:
-                        finalize_parsed_item(r, fp, tp, rep, neu, err)
-                    else:
-                        logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
-                        finalize_parsed_item(r, fp, tp, False, neu, None)
-            buffered_group_results.clear()
-
-            download_elapsed = time.perf_counter() - download_started_at
-            if pending:
-                self.safe_stdout_write("\n")
-
-            parse_elapsed = time.perf_counter() - parse_started_at
+                    pending_batch: List[Tuple[JudgmentRecord, Path, Path]] = []
+                    for record in selected_records:
+                        if self.state.is_downloaded(record.source_id):
+                            skipped += 1
+                            self.write_decision(record, "skipped", "already_downloaded")
+                            continue
+                        final_path = self.build_download_path(record, reserved_paths)
+                        temp_path = self.build_staging_temp_path(record)
+                        pending_batch.append((record, final_path, temp_path))
+                    if not pending_batch:
+                        continue
+                    if not self.args.dry_run:
+                        self.ensure_pdf_runtime_ready()
+                    downloaded, skipped, failed, d_elapsed, p_elapsed = self.execute_pending_batch(
+                        pending_batch, downloaded, skipped, failed
+                    )
+                    download_elapsed += d_elapsed
+                    parse_elapsed += p_elapsed
+                discovery_elapsed = time.perf_counter() - discovery_started_at
+            else:
+                downloaded, skipped, failed, download_elapsed, parse_elapsed = self.execute_pending_batch(
+                    pending, downloaded, skipped, failed
+                )
             total_elapsed = time.perf_counter() - run_started_at
             average_per_pdf = total_elapsed / processed if processed else 0.0
             run_finished_iso = datetime.now().isoformat(timespec="seconds")
@@ -848,6 +668,11 @@ class SciJudgmentScraper:
         self._run_chunk_stats.append(chunk_stat)
 
     def _iter_from_human_captcha_date_form(self, start_date: date, end_date: date) -> Iterator[JudgmentRecord]:
+        for batch in self._iter_human_captcha_record_batches(start_date, end_date):
+            for rec in batch:
+                yield rec
+
+    def _iter_human_captcha_record_batches(self, start_date: date, end_date: date) -> Iterator[List[JudgmentRecord]]:
         if not self.args.captcha_form_url:
             raise ValueError("captcha_form_url is required when --human-captcha is enabled")
 
@@ -872,7 +697,20 @@ class SciJudgmentScraper:
                 }
             )
 
-        for chunk_start, chunk_end in pending_chunks:
+        solve_mode = str(getattr(self.args, "captcha_solve_mode", "solve_all_first"))
+        batch_size = int(getattr(self.args, "captcha_batch_size", 5))
+        if batch_size < 1:
+            batch_size = 1
+        logging.info(
+            "CAPTCHA interaction mode: %s%s",
+            solve_mode,
+            f" (batch_size={batch_size})" if solve_mode == "solve_in_batches" else "",
+        )
+
+        def process_chunk(
+            chunk_start: date, chunk_end: date, data: Optional[object], form_fields: Dict[str, str]
+        ) -> List[JudgmentRecord]:
+            rows: List[JudgmentRecord] = []
             chunk_started_at = time.perf_counter()
             chunk_stat: Dict[str, object] = {
                 "mode": "human_captcha",
@@ -886,24 +724,12 @@ class SciJudgmentScraper:
                 "yielded_records": 0,
                 "status": "ok",
             }
-            logging.info("Fetching judgments for %s to %s via CAPTCHA form", chunk_start, chunk_end)
-            data, form_fields = self._solve_captcha_and_fetch_first_page(chunk_start, chunk_end)
-            solved_chunks += 1
-            if self.progress_callback is not None:
-                self.progress_callback(
-                    {
-                        "event": "captcha_progress",
-                        "total": total_required,
-                        "solved": solved_chunks,
-                        "remaining": max(0, total_required - solved_chunks),
-                    }
-                )
             if data is None:
                 chunk_stat["status"] = "no_data"
                 chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
                 self._run_chunk_stats.append(chunk_stat)
                 self._mark_chunk_completed(chunk_start, chunk_end)
-                continue
+                return rows
 
             first_records, pagination, first_case_refs = parse_ajax_payload_to_records(data, self.args.index_url)
             detail_records = self._fetch_records_from_case_refs(first_case_refs)
@@ -924,14 +750,15 @@ class SciJudgmentScraper:
                 if not (start_date <= rec.judgment_date <= end_date):
                     continue
                 chunk_stat["yielded_records"] = int(chunk_stat["yielded_records"]) + 1
-                yield rec
+                rows.append(rec)
 
             nonce = pagination.get("nonce")
             page_ids = pagination.get("page_ids", [])
             if not nonce:
                 chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
                 self._run_chunk_stats.append(chunk_stat)
-                continue
+                self._mark_chunk_completed(chunk_start, chunk_end)
+                return rows
 
             for page_id in page_ids:
                 if page_id <= 1:
@@ -960,10 +787,53 @@ class SciJudgmentScraper:
                     if not (start_date <= rec.judgment_date <= end_date):
                         continue
                     chunk_stat["yielded_records"] = int(chunk_stat["yielded_records"]) + 1
-                    yield rec
+                    rows.append(rec)
             chunk_stat["duration_seconds"] = round(time.perf_counter() - chunk_started_at, 3)
             self._run_chunk_stats.append(chunk_stat)
             self._mark_chunk_completed(chunk_start, chunk_end)
+            return rows
+
+        def solve_chunk(chunk_start: date, chunk_end: date) -> Tuple[date, date, Optional[object], Dict[str, str]]:
+            nonlocal solved_chunks
+            logging.info("Fetching judgments for %s to %s via CAPTCHA form", chunk_start, chunk_end)
+            data, form_fields = self._solve_captcha_and_fetch_first_page(chunk_start, chunk_end)
+            solved_chunks += 1
+            if self.progress_callback is not None:
+                self.progress_callback(
+                    {
+                        "event": "captcha_progress",
+                        "total": total_required,
+                        "solved": solved_chunks,
+                        "remaining": max(0, total_required - solved_chunks),
+                    }
+                )
+            return chunk_start, chunk_end, data, form_fields
+
+        if solve_mode == "solve_all_first":
+            solved_payloads = [solve_chunk(cs, ce) for cs, ce in pending_chunks]
+            all_rows: List[JudgmentRecord] = []
+            for cs, ce, data, form_fields in solved_payloads:
+                all_rows.extend(process_chunk(cs, ce, data, form_fields))
+            if all_rows:
+                yield all_rows
+            return
+
+        if solve_mode == "solve_in_batches":
+            for i in range(0, len(pending_chunks), batch_size):
+                batch = pending_chunks[i : i + batch_size]
+                solved_payloads = [solve_chunk(cs, ce) for cs, ce in batch]
+                batch_rows: List[JudgmentRecord] = []
+                for cs, ce, data, form_fields in solved_payloads:
+                    batch_rows.extend(process_chunk(cs, ce, data, form_fields))
+                if batch_rows:
+                    yield batch_rows
+            return
+
+        for cs, ce in pending_chunks:
+            _, _, data, form_fields = solve_chunk(cs, ce)
+            chunk_rows = process_chunk(cs, ce, data, form_fields)
+            if chunk_rows:
+                yield chunk_rows
 
     def _solve_captcha_and_fetch_first_page(
         self, chunk_start: date, chunk_end: date
@@ -1184,6 +1054,257 @@ class SciJudgmentScraper:
                     yield record, final_path, downloaded_path, None, elapsed_seconds
                 except Exception as exc:
                     yield record, final_path, temp_path, str(exc), 0.0
+
+    def execute_pending_batch(
+        self,
+        pending: List[Tuple[JudgmentRecord, Path, Path]],
+        downloaded: int,
+        skipped: int,
+        failed: int,
+    ) -> Tuple[int, int, int, float, float]:
+        if not pending:
+            return downloaded, skipped, failed, 0.0, 0.0
+
+        logging.info(
+            "Prepared %s judgments for download using %s download worker(s) and %s parse worker(s)",
+            len(pending),
+            self.args.download_workers,
+            self.args.parse_workers,
+        )
+        self.print_progress(0, len(pending), 0, 0, 0)
+
+        download_started_at = time.perf_counter()
+        parse_started_at = time.perf_counter()
+        completed_items = 0
+        judgment_group_totals: Dict[str, int] = {}
+        for rec, _, _ in pending:
+            group_key = build_judgment_group_key(rec)
+            judgment_group_totals[group_key] = judgment_group_totals.get(group_key, 0) + 1
+        buffered_group_results: Dict[
+            str, List[Tuple[JudgmentRecord, Path, Path, bool, Optional[str], Optional[str]]]
+        ] = {}
+
+        def finalize_parsed_item(
+            record: JudgmentRecord,
+            final_path: Path,
+            temp_path: Path,
+            is_reportable: bool,
+            neutral: Optional[str],
+            error: Optional[str],
+        ) -> None:
+            nonlocal downloaded, skipped, failed
+            try:
+                if error:
+                    failed += 1
+                    self.state.mark_failed(record, error)
+                    self.write_failure(record, error)
+                    self.write_decision(record, "failed", f"analyze_error: {error}")
+                    logging.error("Failed to analyze %s: %s", record.source_id, error)
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return
+
+                if self.args.dry_run:
+                    is_reportable = True
+
+                if self.args.reportable_mode == "reportable" and not is_reportable:
+                    skipped += 1
+                    self.write_decision(record, "skipped", "pdf_not_reportable")
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return
+
+                if self.args.dry_run:
+                    local_path = final_path
+                else:
+                    temp_path.replace(final_path)
+                    local_path = final_path
+
+                if neutral:
+                    record.neutral_citation = neutral
+                    local_path = self.rename_with_neutral_citation(local_path, neutral)
+
+                self.state.mark_downloaded(record, local_path)
+                self.write_metadata(record, local_path)
+                self.write_decision(record, "downloaded", "ok")
+                downloaded += 1
+            except Exception as exc:
+                failed += 1
+                self.state.mark_failed(record, str(exc))
+                self.write_failure(record, str(exc))
+                self.write_decision(record, "failed", f"finalize_error: {exc}")
+                logging.exception("Failed to finalize %s", record.source_id)
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        def handle_analyzed_item(
+            record: JudgmentRecord,
+            final_path: Path,
+            temp_path: Path,
+            is_reportable: bool,
+            neutral: Optional[str],
+            error: Optional[str],
+        ) -> None:
+            if error:
+                finalize_parsed_item(record, final_path, temp_path, is_reportable, neutral, error)
+                return
+
+            group_key = build_judgment_group_key(record)
+            if judgment_group_totals.get(group_key, 0) <= 1:
+                finalize_parsed_item(record, final_path, temp_path, is_reportable, neutral, None)
+                return
+
+            group_entries = buffered_group_results.setdefault(group_key, [])
+            group_entries.append((record, final_path, temp_path, is_reportable, neutral, None))
+            if len(group_entries) < judgment_group_totals[group_key]:
+                return
+
+            keep_index = select_preferred_record_index(group_entries)
+            for idx, entry in enumerate(group_entries):
+                r, fp, tp, rep, neu, err = entry
+                if idx == keep_index:
+                    finalize_parsed_item(r, fp, tp, rep, neu, err)
+                else:
+                    logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
+                    finalize_parsed_item(r, fp, tp, False, neu, None)
+            buffered_group_results.pop(group_key, None)
+
+        def reconcile_group_after_download_error(record: JudgmentRecord) -> None:
+            group_key = build_judgment_group_key(record)
+            if judgment_group_totals.get(group_key, 0) <= 1:
+                return
+            judgment_group_totals[group_key] = max(0, judgment_group_totals[group_key] - 1)
+            group_entries = buffered_group_results.get(group_key, [])
+            if not group_entries:
+                return
+            if len(group_entries) < judgment_group_totals[group_key]:
+                return
+            keep_index = select_preferred_record_index(group_entries)
+            for idx, entry in enumerate(group_entries):
+                r, fp, tp, rep, neu, err = entry
+                if idx == keep_index:
+                    finalize_parsed_item(r, fp, tp, rep, neu, err)
+                else:
+                    logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
+                    finalize_parsed_item(r, fp, tp, False, neu, None)
+            buffered_group_results.pop(group_key, None)
+
+        if self.args.dry_run:
+            for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
+                completed_items += 1
+                if error:
+                    failed += 1
+                    self.state.mark_failed(record, error)
+                    self.write_failure(record, error)
+                    self.write_decision(record, "failed", f"download_error: {error}")
+                    logging.error("Failed to download %s: %s", record.source_id, error)
+                    reconcile_group_after_download_error(record)
+                else:
+                    handle_analyzed_item(record, final_path, temp_path, True, record.neutral_citation, None)
+                self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+        else:
+            parse_futures = {}
+            with ThreadPoolExecutor(max_workers=self.args.parse_workers) as parse_executor:
+                for record, final_path, temp_path, error, elapsed_seconds in self.download_records_parallel(pending):
+                    if error:
+                        failed += 1
+                        completed_items += 1
+                        self.state.mark_failed(record, error)
+                        self.write_failure(record, error)
+                        self.write_decision(record, "failed", f"download_error: {error}")
+                        logging.error("Failed to download %s: %s", record.source_id, error)
+                        reconcile_group_after_download_error(record)
+                        self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+                        continue
+
+                    future = parse_executor.submit(self._analyze_single_download, record, temp_path)
+                    parse_futures[future] = (record, final_path, temp_path)
+
+                    while parse_futures:
+                        done, _ = wait(set(parse_futures.keys()), timeout=0, return_when=FIRST_COMPLETED)
+                        if not done:
+                            break
+                        for parsed_future in done:
+                            default_record, default_final_path, default_temp_path = parse_futures.pop(parsed_future)
+                            try:
+                                (
+                                    analyzed_record,
+                                    analyzed_path,
+                                    is_reportable,
+                                    neutral,
+                                    parse_error,
+                                ) = parsed_future.result()
+                                handle_analyzed_item(
+                                    analyzed_record,
+                                    default_final_path,
+                                    analyzed_path,
+                                    is_reportable,
+                                    neutral,
+                                    parse_error,
+                                )
+                            except Exception as exc:
+                                handle_analyzed_item(
+                                    default_record,
+                                    default_final_path,
+                                    default_temp_path,
+                                    False,
+                                    None,
+                                    str(exc),
+                                )
+                            completed_items += 1
+                            self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+
+                for parsed_future in as_completed(list(parse_futures.keys())):
+                    default_record, default_final_path, default_temp_path = parse_futures.pop(parsed_future)
+                    try:
+                        (
+                            analyzed_record,
+                            analyzed_path,
+                            is_reportable,
+                            neutral,
+                            parse_error,
+                        ) = parsed_future.result()
+                        handle_analyzed_item(
+                            analyzed_record,
+                            default_final_path,
+                            analyzed_path,
+                            is_reportable,
+                            neutral,
+                            parse_error,
+                        )
+                    except Exception as exc:
+                        handle_analyzed_item(
+                            default_record,
+                            default_final_path,
+                            default_temp_path,
+                            False,
+                            None,
+                            str(exc),
+                        )
+                    completed_items += 1
+                    self.print_progress(completed_items, len(pending), downloaded, skipped, failed)
+
+        for group_entries in list(buffered_group_results.values()):
+            keep_index = select_preferred_record_index(group_entries)
+            for idx, entry in enumerate(group_entries):
+                r, fp, tp, rep, neu, err = entry
+                if idx == keep_index:
+                    finalize_parsed_item(r, fp, tp, rep, neu, err)
+                else:
+                    logging.info("Skipping duplicate PDF candidate for %s: %s", r.case_title, r.pdf_url)
+                    finalize_parsed_item(r, fp, tp, False, neu, None)
+        buffered_group_results.clear()
+
+        batch_download_elapsed = time.perf_counter() - download_started_at
+        batch_parse_elapsed = time.perf_counter() - parse_started_at
+        self.safe_stdout_write("\n")
+        return downloaded, skipped, failed, batch_download_elapsed, batch_parse_elapsed
 
     def _analyze_single_download(
         self, record: JudgmentRecord, temp_path: Path
@@ -1414,6 +1535,8 @@ class SciJudgmentScraper:
             "end_date": end_date.isoformat(),
             "human_captcha": bool(self.args.human_captcha),
             "captcha_max_days": int(self.args.captcha_max_days),
+            "captcha_solve_mode": str(getattr(self.args, "captcha_solve_mode", "solve_all_first")),
+            "captcha_batch_size": int(getattr(self.args, "captcha_batch_size", 5)),
             "reportable_mode": self.args.reportable_mode,
             "reportable_check": self.args.reportable_check,
             "output_dir": str(self.output_dir),
@@ -2376,6 +2499,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum days per query chunk for CAPTCHA mode",
     )
     parser.add_argument(
+        "--captcha-solve-mode",
+        default="solve_all_first",
+        choices=["inline", "solve_all_first", "solve_in_batches"],
+        help="CAPTCHA interaction mode: solve all chunks first (default), inline, or solve in batches.",
+    )
+    parser.add_argument(
+        "--captcha-batch-size",
+        type=int,
+        default=5,
+        help="Batch size for --captcha-solve-mode=solve_in_batches.",
+    )
+    parser.add_argument(
         "--chunk-resume",
         action="store_true",
         default=True,
@@ -2476,6 +2611,8 @@ def main() -> int:
         parser.error("--download-workers must be at least 1")
     if args.parse_workers < 1:
         parser.error("--parse-workers must be at least 1")
+    if args.captcha_batch_size < 1:
+        parser.error("--captcha-batch-size must be at least 1")
     configure_logging(args.log_level)
 
     try:
