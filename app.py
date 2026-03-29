@@ -170,8 +170,9 @@ def ensure_state() -> None:
     state.setdefault("captcha_seq", 0)
     state.setdefault("captcha_progress", {"total": 0, "solved": 0, "remaining": 0})
     state.setdefault("confirm_stop_exit", False)
-    state.setdefault("exit_notice", False)
-    state.setdefault("exit_notice_at", 0.0)
+    state.setdefault("confirm_exit_app", False)
+    state.setdefault("stop_notice", False)
+    state.setdefault("exit_requested", False)
     state.setdefault("exit_cleanup_count", 0)
     state.setdefault("show_success_banner", False)
     state.setdefault("show_output_folder_fallback", False)
@@ -621,53 +622,71 @@ def render_sidebar() -> None:
         "has_started_run", False
     )
 
-    if st.sidebar.button(
-        "Start Download",
-        disabled=st.session_state.run_active or bool(validation_error) or startup_blocked,
-    ):
-        bridge = FrontendRunBridge()
-        st.session_state.bridge = bridge
-        st.session_state.logs = []
-        st.session_state.progress = {"completed": 0, "total": 0, "downloaded": 0, "skipped": 0, "failed": 0}
-        st.session_state.summary = None
-        st.session_state.captcha = None
-        st.session_state.error_message = ""
-        st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
-        st.session_state.run_active = True
-        st.session_state.has_started_run = True
-        st.session_state.confirm_stop_exit = False
-        st.session_state.exit_notice = False
-        st.session_state.exit_cleanup_count = 0
-        st.session_state.show_success_banner = False
-        bridge.start(build_ui_args())
-        st.rerun()
-
-    if not st.session_state.get("confirm_stop_exit", False):
-        if st.sidebar.button("Stop and Exit"):
-            st.session_state.confirm_stop_exit = True
+    if not st.session_state.run_active:
+        if st.sidebar.button(
+            "Start Download",
+            disabled=bool(validation_error) or startup_blocked,
+        ):
+            bridge = FrontendRunBridge()
+            st.session_state.bridge = bridge
+            st.session_state.logs = []
+            st.session_state.progress = {"completed": 0, "total": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+            st.session_state.summary = None
+            st.session_state.captcha = None
+            st.session_state.error_message = ""
+            st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.run_active = True
+            st.session_state.has_started_run = True
+            st.session_state.confirm_stop_exit = False
+            st.session_state.stop_notice = False
+            st.session_state.exit_cleanup_count = 0
+            st.session_state.show_success_banner = False
+            bridge.start(build_ui_args())
             st.rerun()
     else:
-        st.sidebar.warning("Are you sure you want to stop the run and exit the app?")
-        col1, col2 = st.sidebar.columns(2)
-        if col1.button("Confirm Exit"):
-            bridge = st.session_state.get("bridge")
-            if bridge is not None:
-                try:
-                    bridge.submit_answer("q")
-                except Exception:
-                    pass
-            st.session_state.exit_cleanup_count = cleanup_partial_downloads(
-                st.session_state.get("active_output_dir", resolve_run_output_dir())
-            )
-            st.session_state.run_active = False
-            st.session_state.captcha = None
-            st.session_state.confirm_stop_exit = False
-            st.session_state.exit_notice = True
-            st.session_state.exit_notice_at = time.monotonic()
-            st.rerun()
-        if col2.button("Cancel"):
-            st.session_state.confirm_stop_exit = False
-            st.rerun()
+        if not st.session_state.get("confirm_stop_exit", False):
+            if st.sidebar.button("Stop Download"):
+                st.session_state.confirm_stop_exit = True
+                st.rerun()
+        else:
+            st.sidebar.warning("Are you sure you want to stop the current download?")
+            col1, col2 = st.sidebar.columns(2)
+            if col1.button("Confirm Stop"):
+                bridge = st.session_state.get("bridge")
+                if bridge is not None:
+                    try:
+                        bridge.submit_answer("q")
+                    except Exception:
+                        pass
+                st.session_state.exit_cleanup_count = cleanup_partial_downloads(
+                    st.session_state.get("active_output_dir", resolve_run_output_dir())
+                )
+                st.session_state.run_active = False
+                st.session_state.captcha = None
+                st.session_state.confirm_stop_exit = False
+                st.session_state.stop_notice = True
+                st.rerun()
+            if col2.button("Cancel"):
+                st.session_state.confirm_stop_exit = False
+                st.rerun()
+
+    if st.session_state.run_active:
+        st.sidebar.caption("Stop the current download to enable Exit App.")
+    else:
+        if not st.session_state.get("confirm_exit_app", False):
+            if st.sidebar.button("Exit App"):
+                st.session_state.confirm_exit_app = True
+                st.rerun()
+        else:
+            st.sidebar.warning("Are you sure you want to exit the app?")
+            col1, col2 = st.sidebar.columns(2)
+            if col1.button("Confirm Exit"):
+                st.session_state.confirm_exit_app = False
+                st.session_state.exit_requested = True
+                st.rerun()
+            if col2.button("Cancel"):
+                st.session_state.confirm_exit_app = False
+                st.rerun()
 
 
 def render_status() -> None:
@@ -766,15 +785,9 @@ def render_captcha() -> None:
                         st.session_state.captcha = None
                         st.rerun()
 
-                col1, col2 = st.columns(2)
-                if col1.button("Refresh CAPTCHA"):
+                if st.button("Refresh CAPTCHA"):
                     st.session_state.bridge.submit_answer("r")
                     st.session_state.captcha = None
-                    st.rerun()
-                if col2.button("Abort Run"):
-                    st.session_state.bridge.submit_answer("q")
-                    st.session_state.captcha = None
-                    st.session_state.run_active = False
                     st.rerun()
 
     # Best-effort autofocus for the CAPTCHA field on each new challenge.
@@ -938,17 +951,10 @@ def render_live_sections() -> None:
 def main() -> None:
     st.set_page_config(page_title="SCI Judgment Downloader", layout="wide")
     ensure_state()
-    if st.session_state.get("exit_notice", False):
+    if st.session_state.get("exit_requested", False):
         st.title("SCI Judgment Downloader")
-        st.success("Application stopped successfully.")
-        removed_count = int(st.session_state.get("exit_cleanup_count", 0))
-        if removed_count > 0:
-            st.info(f"Cleaned up {removed_count} partial download file(s).")
-        st.info("You may now close this tab.")
-        started = float(st.session_state.get("exit_notice_at", 0.0))
-        if started and (time.monotonic() - started) >= 2.0:
-            os._exit(0)
-        time.sleep(2.0)
+        st.success("Application closed. You may close this tab.")
+        time.sleep(1.0)
         os._exit(0)
     run_startup_checks(force=False)
 
@@ -956,6 +962,11 @@ def main() -> None:
     st.caption("Local frontend for Supreme Court of India judgment downloads.")
     if st.session_state.get("show_success_banner", False):
         st.success("Download finished successfully.")
+    if st.session_state.get("stop_notice", False):
+        st.info("Download stopped.")
+        removed_count = int(st.session_state.get("exit_cleanup_count", 0))
+        if removed_count > 0:
+            st.caption(f"Cleaned up {removed_count} partial download file(s).")
     render_startup_checks()
 
     render_sidebar()
