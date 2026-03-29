@@ -174,6 +174,7 @@ def ensure_state() -> None:
     state.setdefault("exit_notice_at", 0.0)
     state.setdefault("exit_cleanup_count", 0)
     state.setdefault("show_success_banner", False)
+    state.setdefault("show_output_folder_fallback", False)
 
 
 def cleanup_partial_downloads(output_dir: str) -> int:
@@ -545,11 +546,16 @@ def render_sidebar() -> None:
         selected = pick_output_folder(current)
         if selected:
             st.session_state.output_dir = selected
+            st.session_state.show_output_folder_fallback = False
             st.rerun()
         else:
-            st.sidebar.warning(
-                f"Folder picker is unavailable on this system. Using default: {default_output_dir()}"
-            )
+            st.session_state.show_output_folder_fallback = True
+            st.sidebar.info("Could not open folder browser. You can keep this path or use the default folder.")
+    if st.session_state.get("show_output_folder_fallback", False):
+        if st.sidebar.button("Use default folder", disabled=browse_disabled):
+            st.session_state.output_dir = default_output_dir()
+            st.session_state.show_output_folder_fallback = False
+            st.rerun()
     st.sidebar.caption("Already-downloaded files in this folder will be skipped.")
     if st.session_state.ui_mode == "Advanced":
         st.session_state.download_workers = st.sidebar.slider(
