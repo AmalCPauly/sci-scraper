@@ -29,6 +29,10 @@ REPORTABLE_CHECK_LABELS = {
     "metadata_or_pdf": "Check metadata first, then PDF",
     "metadata": "Check metadata only (Fastest)",
 }
+DOWNLOAD_MODE_LABELS = {
+    "reportable": "Only reportable judgments (Recommended)",
+    "all": "All judgments (reportable + non-reportable)",
+}
 STARTUP_FAILURE_LABELS = {
     "Writable output folder": "Cannot write to output folder",
     "Network/SSL to sci.gov.in": "Cannot reach sci.gov.in",
@@ -607,6 +611,7 @@ def render_sidebar() -> None:
             "Download mode",
             ["reportable", "all"],
             index=["reportable", "all"].index(st.session_state.get("reportable_mode", "reportable")),
+            format_func=lambda value: DOWNLOAD_MODE_LABELS.get(value, value),
             disabled=st.session_state.run_active,
         )
         st.session_state.reportable_check = st.sidebar.selectbox(
@@ -621,18 +626,6 @@ def render_sidebar() -> None:
                 "How to identify reportable judgments. "
                 "PDF content is most reliable; metadata-only is fastest but may miss/mislabel some files."
             ),
-        )
-        st.session_state.log_level = st.sidebar.selectbox(
-            "Log level",
-            ["INFO", "DEBUG", "WARNING", "ERROR"],
-            index=["INFO", "DEBUG", "WARNING", "ERROR"].index(st.session_state.get("log_level", "INFO")),
-            disabled=st.session_state.run_active,
-        )
-        st.session_state.keep_run_diagnostics = st.sidebar.toggle(
-            "Keep run diagnostics",
-            value=bool(st.session_state.get("keep_run_diagnostics", False)),
-            disabled=st.session_state.run_active,
-            help="When enabled, stores per-run manifest JSON files for troubleshooting.",
         )
         st.sidebar.selectbox(
             "CAPTCHA interaction",
@@ -650,6 +643,19 @@ def render_sidebar() -> None:
                 step=1,
                 key="captcha_batch_size",
                 disabled=st.session_state.run_active,
+            )
+        with st.sidebar.expander("Diagnostics", expanded=False):
+            st.session_state.log_level = st.selectbox(
+                "Log level",
+                ["INFO", "DEBUG", "WARNING", "ERROR"],
+                index=["INFO", "DEBUG", "WARNING", "ERROR"].index(st.session_state.get("log_level", "INFO")),
+                disabled=st.session_state.run_active,
+            )
+            st.session_state.keep_run_diagnostics = st.toggle(
+                "Keep run diagnostics",
+                value=bool(st.session_state.get("keep_run_diagnostics", False)),
+                disabled=st.session_state.run_active,
+                help="When enabled, stores per-run manifest JSON files for troubleshooting.",
             )
 
     if validation_error:
