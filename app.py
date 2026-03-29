@@ -676,37 +676,40 @@ def render_status() -> None:
     completed = int(progress.get("completed", 0))
     ratio = (completed / total) if total else 0.0
 
-    st.subheader("Progress")
-    st.progress(ratio, text=f"{completed} / {total} completed" if total else "Waiting to start")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Downloaded", progress.get("downloaded", 0))
-    col2.metric("Skipped", progress.get("skipped", 0))
-    col3.metric("Failed", progress.get("failed", 0))
-    col4.metric("Queued", max(total - completed, 0))
-
     summary = st.session_state.summary
+    if not summary:
+        st.subheader("Progress")
+        st.progress(ratio, text=f"{completed} / {total} completed" if total else "Waiting to start")
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Downloaded", progress.get("downloaded", 0))
+        col2.metric("Skipped", progress.get("skipped", 0))
+        col3.metric("Failed", progress.get("failed", 0))
+        col4.metric("Queued", max(total - completed, 0))
+
     if summary:
-        st.subheader("Summary")
-        st.write(
-            f"Processed `{summary['processed']}`, downloaded `{summary['downloaded']}`, "
-            f"skipped `{summary['skipped']}`, failed `{summary['failed']}`."
-        )
-        st.write(
-            f"Total time: `{format_duration(summary['total_elapsed_seconds'])}` | "
-            f"Average per processed document: `{format_duration(summary['average_per_processed_seconds'])}`"
-        )
-        st.write(f"Output folder: `{st.session_state.active_output_dir}`")
-        if st.button("Open output folder"):
-            output_dir = Path(st.session_state.active_output_dir)
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                if os.name == "nt" and hasattr(os, "startfile"):
-                    os.startfile(str(output_dir))  # type: ignore[attr-defined]
-                else:
-                    st.info(f"Open this folder manually: {output_dir}")
-            except Exception as exc:
-                st.error(f"Could not open output folder: {exc}")
+        with st.container(border=True):
+            st.subheader("Download Complete")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Downloaded", int(summary.get("downloaded", 0)))
+            c2.metric("Skipped", int(summary.get("skipped", 0)))
+            c3.metric("Failed", int(summary.get("failed", 0)))
+            st.write(
+                f"Total time: `{format_duration(float(summary.get('total_elapsed_seconds', 0.0)))}`"
+                " | "
+                f"Average time per document: `{format_duration(float(summary.get('average_per_processed_seconds', 0.0)))}`"
+            )
+            st.write(f"Output folder: `{st.session_state.active_output_dir}`")
+            if st.button("Open Output Folder"):
+                output_dir = Path(st.session_state.active_output_dir)
+                try:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    if os.name == "nt" and hasattr(os, "startfile"):
+                        os.startfile(str(output_dir))  # type: ignore[attr-defined]
+                    else:
+                        st.info(f"Open this folder manually: {output_dir}")
+                except Exception as exc:
+                    st.error(f"Could not open output folder: {exc}")
 
     if st.session_state.error_message:
         st.error(st.session_state.error_message)
