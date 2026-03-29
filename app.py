@@ -720,59 +720,135 @@ def render_captcha() -> None:
     total = int(captcha_progress.get("total", 0))
     solved = int(captcha_progress.get("solved", 0))
     remaining = int(captcha_progress.get("remaining", 0))
-    if total > 0 and solved < total:
-        st.subheader("CAPTCHA Progress")
-        ratio = max(0.0, min(1.0, solved / total))
-        st.progress(ratio, text=f"Solved {solved}/{total} | Remaining {remaining}")
 
     challenge = st.session_state.captcha
-    if not challenge:
+    solve_mode = str(st.session_state.get("captcha_solve_mode", "solve_all_first"))
+    keep_card_while_waiting = (
+        challenge is None
+        and st.session_state.get("run_active", False)
+        and solve_mode == "solve_all_first"
+        and total > 0
+        and solved < total
+    )
+    if not challenge and not keep_card_while_waiting:
         return
 
-    st.subheader("CAPTCHA Required")
-    st.write(challenge["prompt"])
-    st.image(challenge["path"], caption="Solve this CAPTCHA to continue", use_container_width=False)
-    captcha_input_key = f"captcha_answer_{int(st.session_state.get('captcha_seq', 0))}"
-    with st.form(key=f"captcha_form_{int(st.session_state.get('captcha_seq', 0))}"):
-        answer = st.number_input(
-            "CAPTCHA answer",
-            min_value=0,
-            step=1,
-            key=captcha_input_key,
-            format="%d",
-        )
-        submitted = st.form_submit_button("Submit CAPTCHA")
-    if submitted:
-        st.session_state.bridge.submit_answer(str(int(answer)))
-        st.session_state.captcha = None
-        st.rerun()
+    _, captcha_col, _ = st.columns([1, 2, 1])
+    with captcha_col:
+        with st.container(border=True):
+            st.subheader("CAPTCHA Verification")
+            if total > 0 and solved < total:
+                st.caption(f"Solved {solved}/{total} | Remaining {remaining}")
+                ratio = max(0.0, min(1.0, solved / total))
+                st.progress(ratio)
+            if challenge is None:
+                st.info("Loading next CAPTCHA...")
+            else:
+                st.write("Enter the CAPTCHA result below.")
+                st.image(challenge["path"], use_container_width=False)
+                captcha_input_key = f"captcha_answer_{int(st.session_state.get('captcha_seq', 0))}"
+                with st.form(key=f"captcha_form_{int(st.session_state.get('captcha_seq', 0))}"):
+                    answer_raw = st.text_input(
+                        "CAPTCHA answer",
+                        key=captcha_input_key,
+                        placeholder="Numbers only",
+                    )
+                    st.caption("Press Enter to submit.")
+                    submitted = st.form_submit_button("Submit CAPTCHA")
+                if submitted:
+                    answer_str = str(answer_raw).strip()
+                    if not answer_str:
+                        st.warning("Please enter the CAPTCHA value.")
+                    elif not answer_str.isdigit():
+                        st.warning("Please enter numbers only.")
+                    else:
+                        st.session_state.bridge.submit_answer(answer_str)
+                        st.session_state.captcha = None
+                        st.rerun()
+
+                col1, col2 = st.columns(2)
+                if col1.button("Refresh CAPTCHA"):
+                    st.session_state.bridge.submit_answer("r")
+                    st.session_state.captcha = None
+                    st.rerun()
+                if col2.button("Abort Run"):
+                    st.session_state.bridge.submit_answer("q")
+                    st.session_state.captcha = None
+                    st.session_state.run_active = False
+                    st.rerun()
 
     # Best-effort autofocus for the CAPTCHA field on each new challenge.
+    current_captcha_seq = int(st.session_state.get("captcha_seq", 0))
     components.html(
         """
         <script>
-          const focusCaptcha = () => {
-            const root = window.parent?.document || document;
-            const input = root.querySelector('input[aria-label="CAPTCHA answer"]');
-            if (input) { input.focus(); input.select(); }
+          const CAPTCHA_SEQ = %d;
+          const docs = [];
+          try { if (window.parent && window.parent.document) docs.push(window.parent.document); } catch (e) {}
+          try { if (window.top && window.top.document) docs.push(window.top.document); } catch (e) {}
+          if (!docs.length) docs.push(document);
+
+          const findCaptchaInput = (doc) => {
+            const exact =
+              doc.querySelector('input[placeholder="Numbers only"]:not([disabled])') ||
+              doc.querySelector('input[aria-label="CAPTCHA answer"]:not([disabled])');
+            if (exact) return exact;
+
+            const inputs = Array.from(doc.querySelectorAll('input[type="text"]:not([disabled])'));
+            for (const el of inputs) {
+              const ph = (el.getAttribute("placeholder") || "").toLowerCase();
+              const al = (el.getAttribute("aria-label") || "").toLowerCase();
+              if (ph.includes("captcha") || ph.includes("numbers only") || al.includes("captcha")) {
+                return el;
+              }
+            }
+            return null;
           };
-          setTimeout(focusCaptcha, 0);
-          setTimeout(focusCaptcha, 150);
+
+          const tryFocus = () => {
+            for (const doc of docs) {
+              const input = findCaptchaInput(doc);
+              if (input && input.offsetParent !== null) {
+                input.focus();
+                input.select();
+                return true;
+              }
+            }
+            return false;
+          };
+
+          if (tryFocus()) {
+            // done
+          } else {
+            const started = Date.now();
+            const timer = setInterval(() => {
+              if (tryFocus() || (Date.now() - started > 15000)) {
+                clearInterval(timer);
+              }
+            }, 120);
+
+            // Also observe DOM mutations so focus happens immediately on mount.
+            const observers = [];
+            for (const doc of docs) {
+              try {
+                const obs = new MutationObserver(() => {
+                  if (tryFocus()) {
+                    for (const o of observers) { try { o.disconnect(); } catch (e) {} }
+                  }
+                });
+                obs.observe(doc.body || doc.documentElement, { childList: true, subtree: true });
+                observers.push(obs);
+              } catch (e) {}
+            }
+            setTimeout(() => {
+              for (const o of observers) { try { o.disconnect(); } catch (e) {} }
+            }, 15000);
+          }
         </script>
-        """,
+        """
+        % current_captcha_seq,
         height=0,
     )
-
-    col1, col2 = st.columns(2)
-    if col1.button("Refresh CAPTCHA"):
-        st.session_state.bridge.submit_answer("r")
-        st.session_state.captcha = None
-        st.rerun()
-    if col2.button("Abort Run"):
-        st.session_state.bridge.submit_answer("q")
-        st.session_state.captcha = None
-        st.session_state.run_active = False
-        st.rerun()
 
 
 def render_outputs() -> None:
