@@ -19,6 +19,21 @@ from main import SciJudgmentScraper, build_arg_parser, format_duration
 STARTUP_CHECK_CACHE_SECONDS = 30
 APP_OUTPUT_FOLDER_NAME = "SCIJudgmentDownloader"
 INTERNAL_DATA_DIR_NAME = ".scijudgment_data"
+CAPTCHA_MODE_LABELS = {
+    "inline": "Solve as prompts appear",
+    "solve_all_first": "Solve all CAPTCHAs first (Recommended)",
+    "solve_in_batches": "Solve in batches",
+}
+REPORTABLE_CHECK_LABELS = {
+    "pdf": "Check PDF content only (Recommended)",
+    "metadata_or_pdf": "Check metadata first, then PDF",
+    "metadata": "Check metadata only (Fastest)",
+}
+STARTUP_FAILURE_LABELS = {
+    "Writable output folder": "Cannot write to output folder",
+    "Network/SSL to sci.gov.in": "Cannot reach sci.gov.in",
+    "Dependency/runtime summary": "Required components missing",
+}
 
 
 class QueueLogHandler(logging.Handler):
@@ -327,9 +342,12 @@ def render_startup_checks() -> None:
     if st.session_state.get("has_started_run", False):
         return
 
+    friendly_failures = [
+        STARTUP_FAILURE_LABELS.get(name, name) for name in checks["blocking_failures"]
+    ]
     st.error(
-        "App setup checks failed. Please fix the issue below before starting download:\n\n"
-        + "\n".join(f"- {name}" for name in checks["blocking_failures"])
+        "Please fix the following before starting download:\n\n"
+        + "\n".join(f"- {name}" for name in friendly_failures)
     )
     if st.button("Retry checks"):
         run_startup_checks(force=True)
@@ -553,7 +571,12 @@ def render_sidebar() -> None:
             index=["pdf", "metadata_or_pdf", "metadata"].index(
                 st.session_state.get("reportable_check", "pdf")
             ),
+            format_func=lambda value: REPORTABLE_CHECK_LABELS.get(value, value),
             disabled=st.session_state.run_active,
+            help=(
+                "How to identify reportable judgments. "
+                "PDF content is most reliable; metadata-only is fastest but may miss/mislabel some files."
+            ),
         )
         st.session_state.log_level = st.sidebar.selectbox(
             "Log level",
@@ -571,6 +594,7 @@ def render_sidebar() -> None:
             "CAPTCHA interaction",
             ["solve_all_first", "inline", "solve_in_batches"],
             key="captcha_solve_mode",
+            format_func=lambda mode: CAPTCHA_MODE_LABELS.get(mode, mode),
             disabled=st.session_state.run_active,
             help="Choose whether to solve CAPTCHA per chunk, upfront for all chunks, or in batches.",
         )
@@ -827,10 +851,10 @@ def render_live_sections() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="SCI Judgement Downloader", layout="wide")
+    st.set_page_config(page_title="SCI Judgment Downloader", layout="wide")
     ensure_state()
     if st.session_state.get("exit_notice", False):
-        st.title("SCI Judgement Downloader")
+        st.title("SCI Judgment Downloader")
         st.success("Application stopped successfully.")
         removed_count = int(st.session_state.get("exit_cleanup_count", 0))
         if removed_count > 0:
@@ -843,7 +867,7 @@ def main() -> None:
         os._exit(0)
     run_startup_checks(force=False)
 
-    st.title("SCI Judgement Downloader")
+    st.title("SCI Judgment Downloader")
     st.caption("Local frontend for Supreme Court of India judgment downloads.")
     if st.session_state.get("show_success_banner", False):
         st.success("Download finished successfully.")
