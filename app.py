@@ -501,6 +501,7 @@ def render_sidebar() -> None:
         "Date filter",
         ["Month", "Year", "Custom Range"],
         key="date_mode",
+        horizontal=True,
         disabled=st.session_state.run_active,
     )
     year_options = list(range(today.year, 1949, -1))
@@ -509,7 +510,8 @@ def render_sidebar() -> None:
         selected_month_year = int(st.session_state.get("month_year_value", today.year))
         if selected_month_year not in year_options:
             selected_month_year = today.year
-        st.session_state.month_year_value = st.sidebar.selectbox(
+        month_col1, month_col2 = st.sidebar.columns(2)
+        st.session_state.month_year_value = month_col1.selectbox(
             "Year",
             options=year_options,
             index=year_options.index(selected_month_year),
@@ -534,7 +536,7 @@ def render_sidebar() -> None:
         selected_month_number = int(st.session_state.get("month_number_value", today.month))
         if selected_month_number < 1 or selected_month_number > max_month:
             selected_month_number = max_month
-        selected_month_label = st.sidebar.selectbox(
+        selected_month_label = month_col2.selectbox(
             "Month",
             options=allowed_month_labels,
             index=selected_month_number - 1,
@@ -545,20 +547,23 @@ def render_sidebar() -> None:
         selected_year = int(st.session_state.get("year_value", today.year))
         if selected_year not in year_options:
             selected_year = today.year
-        st.session_state.year_value = st.sidebar.selectbox(
+        year_col1, _year_col2 = st.sidebar.columns(2)
+        st.session_state.year_value = year_col1.selectbox(
             "Year",
             options=year_options,
             index=year_options.index(selected_year),
             disabled=st.session_state.run_active,
         )
     else:
-        st.session_state.from_date_value = st.sidebar.date_input(
+        range_col1, range_col2 = st.sidebar.columns(2)
+        st.session_state.from_date_value = range_col1.date_input(
             "From date",
             value=st.session_state.get("from_date_value"),
+            min_value=date(1950, 1, 1),
             max_value=today,
             disabled=st.session_state.run_active,
         )
-        st.session_state.to_date_value = st.sidebar.date_input(
+        st.session_state.to_date_value = range_col2.date_input(
             "To date",
             value=st.session_state.get("to_date_value"),
             min_value=st.session_state.from_date_value,
