@@ -603,7 +603,6 @@ def render_sidebar() -> None:
             st.session_state.output_dir = default_output_dir()
             st.session_state.show_output_folder_fallback = False
             st.rerun()
-    st.sidebar.caption("Already-downloaded files in this folder will be skipped.")
     if st.session_state.ui_mode == "Advanced":
         st.session_state.download_workers = st.sidebar.slider(
             "Parallel download workers",
@@ -742,6 +741,28 @@ def render_sidebar() -> None:
                 st.rerun()
 
 
+def render_run_setup() -> None:
+    with st.container(border=True):
+        st.subheader("Run Setup")
+        mode = str(st.session_state.get("date_mode", "Month"))
+        if mode == "Year":
+            selected = f"{int(st.session_state.get('year_value', date.today().year))}"
+        elif mode == "Month":
+            selected = (
+                f"{int(st.session_state.get('month_year_value', date.today().year))}-"
+                f"{int(st.session_state.get('month_number_value', date.today().month)):02d}"
+            )
+        else:
+            from_date = st.session_state.get("from_date_value", date.today().replace(day=1))
+            to_date = st.session_state.get("to_date_value", date.today())
+            selected = f"{from_date.isoformat()} to {to_date.isoformat()}"
+
+        c1, c2, c3 = st.columns(3)
+        c1.write(f"Date filter: `{mode}`")
+        c2.write(f"Selected range: `{selected}`")
+        c3.write(f"Output folder: `{resolve_run_output_dir()}`")
+
+
 def render_status() -> None:
     progress = st.session_state.progress
     total = int(progress.get("total", 0))
@@ -750,23 +771,24 @@ def render_status() -> None:
 
     summary = st.session_state.summary
     if not summary:
-        st.subheader("Progress")
-        phase = str(progress.get("phase", "")).strip()
-        if phase:
-            st.session_state.phase_dot_count = (int(st.session_state.get("phase_dot_count", 0)) % 3) + 1
-            dot_count = int(st.session_state.phase_dot_count)
-            st.caption(f"{phase}{'.' * dot_count}")
-        st.progress(ratio, text=f"{completed} / {total} completed" if total else "Waiting to start")
+        with st.container(border=True):
+            st.subheader("Progress")
+            phase = str(progress.get("phase", "")).strip()
+            if phase:
+                st.session_state.phase_dot_count = (int(st.session_state.get("phase_dot_count", 0)) % 3) + 1
+                dot_count = int(st.session_state.phase_dot_count)
+                st.caption(f"{phase}{'.' * dot_count}")
+            st.progress(ratio, text=f"{completed} / {total} completed" if total else "Waiting to start")
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Downloaded", progress.get("downloaded", 0))
-        col2.metric("Skipped", progress.get("skipped", 0))
-        col3.metric("Failed", progress.get("failed", 0))
-        col4.metric("Queued", max(total - completed, 0))
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Downloaded", progress.get("downloaded", 0))
+            col2.metric("Skipped", progress.get("skipped", 0))
+            col3.metric("Failed", progress.get("failed", 0))
+            col4.metric("Queued", max(total - completed, 0))
 
     if summary:
         with st.container(border=True):
-            st.subheader("Download Complete")
+            st.subheader("Results")
             c1, c2, c3 = st.columns(3)
             c1.metric("Downloaded", int(summary.get("downloaded", 0)))
             c2.metric("Skipped", int(summary.get("skipped", 0)))
@@ -810,43 +832,41 @@ def render_captcha() -> None:
     if not challenge and not keep_card_while_waiting:
         return
 
-    _, captcha_col, _ = st.columns([1, 2, 1])
-    with captcha_col:
-        with st.container(border=True):
-            st.subheader("CAPTCHA Verification")
-            if total > 0 and solved < total:
-                st.caption(f"Solved {solved}/{total} | Remaining {remaining}")
-                ratio = max(0.0, min(1.0, solved / total))
-                st.progress(ratio)
-            if challenge is None:
-                st.info("Loading next CAPTCHA...")
-            else:
-                st.write("Enter the CAPTCHA result below.")
-                st.image(challenge["path"], use_container_width=False)
-                captcha_input_key = f"captcha_answer_{int(st.session_state.get('captcha_seq', 0))}"
-                with st.form(key=f"captcha_form_{int(st.session_state.get('captcha_seq', 0))}"):
-                    answer_raw = st.text_input(
-                        "CAPTCHA answer",
-                        key=captcha_input_key,
-                        placeholder="Numbers only",
-                    )
-                    st.caption("Press Enter to submit.")
-                    submitted = st.form_submit_button("Submit CAPTCHA")
-                if submitted:
-                    answer_str = str(answer_raw).strip()
-                    if not answer_str:
-                        st.warning("Please enter the CAPTCHA value.")
-                    elif not answer_str.isdigit():
-                        st.warning("Please enter numbers only.")
-                    else:
-                        st.session_state.bridge.submit_answer(answer_str)
-                        st.session_state.captcha = None
-                        st.rerun()
-
-                if st.button("Refresh CAPTCHA"):
-                    st.session_state.bridge.submit_answer("r")
+    with st.container(border=True):
+        st.subheader("CAPTCHA")
+        if total > 0 and solved < total:
+            st.caption(f"Solved {solved}/{total} | Remaining {remaining}")
+            ratio = max(0.0, min(1.0, solved / total))
+            st.progress(ratio)
+        if challenge is None:
+            st.info("Loading next CAPTCHA...")
+        else:
+            st.write("Enter the CAPTCHA result below.")
+            st.image(challenge["path"], use_container_width=False)
+            captcha_input_key = f"captcha_answer_{int(st.session_state.get('captcha_seq', 0))}"
+            with st.form(key=f"captcha_form_{int(st.session_state.get('captcha_seq', 0))}"):
+                answer_raw = st.text_input(
+                    "CAPTCHA answer",
+                    key=captcha_input_key,
+                    placeholder="Numbers only",
+                )
+                st.caption("Press Enter to submit.")
+                submitted = st.form_submit_button("Submit CAPTCHA")
+            if submitted:
+                answer_str = str(answer_raw).strip()
+                if not answer_str:
+                    st.warning("Please enter the CAPTCHA value.")
+                elif not answer_str.isdigit():
+                    st.warning("Please enter numbers only.")
+                else:
+                    st.session_state.bridge.submit_answer(answer_str)
                     st.session_state.captcha = None
                     st.rerun()
+
+            if st.button("Refresh CAPTCHA"):
+                st.session_state.bridge.submit_answer("r")
+                st.session_state.captcha = None
+                st.rerun()
 
     # Best-effort autofocus for the CAPTCHA field on each new challenge.
     current_captcha_seq = int(st.session_state.get("captcha_seq", 0))
@@ -1008,6 +1028,18 @@ def render_live_sections() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="SCI Judgment Downloader", layout="wide")
+    st.markdown(
+        """
+        <style>
+          div.block-container {
+            max-width: 1000px;
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     ensure_state()
     if st.session_state.get("exit_requested", False):
         st.title("SCI Judgment Downloader")
@@ -1017,7 +1049,6 @@ def main() -> None:
     run_startup_checks(force=False)
 
     st.title("SCI Judgment Downloader")
-    st.caption("Local frontend for Supreme Court of India judgment downloads.")
     if st.session_state.get("show_success_banner", False):
         st.success("Download finished successfully.")
     if st.session_state.get("stop_notice", False):
@@ -1028,6 +1059,7 @@ def main() -> None:
     render_startup_checks()
 
     render_sidebar()
+    render_run_setup()
     render_live_sections()
     if st.session_state.ui_mode == "Advanced":
         render_copy_logs_footer()
