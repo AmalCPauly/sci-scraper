@@ -778,7 +778,12 @@ def render_status() -> None:
                 st.session_state.phase_dot_count = (int(st.session_state.get("phase_dot_count", 0)) % 3) + 1
                 dot_count = int(st.session_state.phase_dot_count)
                 st.caption(f"{phase}{'.' * dot_count}")
-            st.progress(ratio, text=f"{completed} / {total} completed" if total else "Waiting to start")
+            progress_text = (
+                f"{completed} / {total} completed"
+                if total
+                else "Choose date range and click Start Download."
+            )
+            st.progress(ratio, text=progress_text)
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Downloaded", progress.get("downloaded", 0))
