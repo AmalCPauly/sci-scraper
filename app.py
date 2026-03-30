@@ -198,6 +198,7 @@ def ensure_state() -> None:
     state.setdefault("startup_blocking_error", "")
     state.setdefault("captcha_seq", 0)
     state.setdefault("captcha_progress", {"total": 0, "solved": 0, "remaining": 0})
+    state.setdefault("awaiting_next_captcha", False)
     state.setdefault("confirm_stop_exit", False)
     state.setdefault("confirm_exit_app", False)
     state.setdefault("stop_notice", False)
@@ -450,6 +451,7 @@ def drain_events() -> bool:
         elif event["type"] == "captcha":
             st.session_state.captcha_seq = int(st.session_state.get("captcha_seq", 0)) + 1
             st.session_state.captcha = event
+            st.session_state.awaiting_next_captcha = False
         elif event["type"] == "complete":
             st.session_state.summary = {
                 "processed": event["summary"].processed,
@@ -463,6 +465,7 @@ def drain_events() -> bool:
             st.session_state.stopping_run = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.awaiting_next_captcha = False
             st.session_state.show_success_banner = event["summary"].failed == 0
             needs_full_rerun = True
         elif event["type"] == "stopped":
@@ -470,6 +473,7 @@ def drain_events() -> bool:
             st.session_state.stopping_run = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.awaiting_next_captcha = False
             st.session_state.show_success_banner = False
             st.session_state.stop_notice = True
             st.session_state.exit_cleanup_count = cleanup_partial_downloads(
@@ -482,6 +486,7 @@ def drain_events() -> bool:
             st.session_state.stopping_run = False
             st.session_state.captcha = None
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.awaiting_next_captcha = False
             st.session_state.show_success_banner = False
             needs_full_rerun = True
     return needs_full_rerun
@@ -701,6 +706,7 @@ def render_sidebar() -> None:
             st.session_state.captcha = None
             st.session_state.error_message = ""
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
+            st.session_state.awaiting_next_captcha = False
             st.session_state.run_active = True
             st.session_state.run_started_at_monotonic = time.monotonic()
             st.session_state.has_started_run = True
@@ -861,8 +867,10 @@ def render_captcha() -> None:
         challenge is None
         and st.session_state.get("run_active", False)
         and solve_mode == "solve_all_first"
-        and total > 0
-        and solved < total
+        and (
+            bool(st.session_state.get("awaiting_next_captcha", False))
+            or (total > 0 and solved < total)
+        )
     )
     if not challenge and not keep_card_while_waiting:
         return
@@ -896,11 +904,13 @@ def render_captcha() -> None:
                 else:
                     st.session_state.bridge.submit_answer(answer_str)
                     st.session_state.captcha = None
+                    st.session_state.awaiting_next_captcha = True
                     st.rerun()
 
             if st.button("Refresh CAPTCHA"):
                 st.session_state.bridge.submit_answer("r")
                 st.session_state.captcha = None
+                st.session_state.awaiting_next_captcha = True
                 st.rerun()
 
     # Best-effort autofocus for the CAPTCHA field on each new challenge.
