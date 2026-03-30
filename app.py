@@ -148,6 +148,17 @@ def normalize_output_dir(path_str: str) -> str:
     return str(base / APP_OUTPUT_FOLDER_NAME)
 
 
+def format_duration_whole_seconds(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 def ensure_state() -> None:
     state = st.session_state
     state.setdefault("bridge", None)
@@ -192,6 +203,7 @@ def ensure_state() -> None:
     state.setdefault("stop_notice", False)
     state.setdefault("stopping_run", False)
     state.setdefault("exit_requested", False)
+    state.setdefault("run_started_at_monotonic", 0.0)
     state.setdefault("exit_cleanup_count", 0)
     state.setdefault("show_success_banner", False)
     state.setdefault("show_output_folder_fallback", False)
@@ -690,6 +702,7 @@ def render_sidebar() -> None:
             st.session_state.error_message = ""
             st.session_state.captcha_progress = {"total": 0, "solved": 0, "remaining": 0}
             st.session_state.run_active = True
+            st.session_state.run_started_at_monotonic = time.monotonic()
             st.session_state.has_started_run = True
             st.session_state.confirm_stop_exit = False
             st.session_state.stop_notice = False
@@ -784,6 +797,25 @@ def render_status() -> None:
                 else "Choose date range and click Start Download."
             )
             st.progress(ratio, text=progress_text)
+
+            started_at = float(st.session_state.get("run_started_at_monotonic", 0.0) or 0.0)
+            elapsed_seconds = max(0.0, time.monotonic() - started_at) if started_at > 0 else 0.0
+            eta_text = "Pending downloads..."
+            if total > 0 and completed >= 5 and elapsed_seconds > 0 and completed < total:
+                throughput = completed / elapsed_seconds
+                if throughput > 0:
+                    eta_seconds = max(0.0, (total - completed) / throughput)
+                    eta_text = format_duration_whole_seconds(eta_seconds)
+                else:
+                    eta_text = "Calculating..."
+            elif total > 0 and completed >= total:
+                eta_text = "0s"
+            elif total > 0 and completed > 0:
+                eta_text = "Calculating..."
+
+            t1, t2 = st.columns(2)
+            t1.write(f"Elapsed time: `{format_duration_whole_seconds(elapsed_seconds)}`")
+            t2.write(f"ETA: `{eta_text}`")
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Downloaded", progress.get("downloaded", 0))
