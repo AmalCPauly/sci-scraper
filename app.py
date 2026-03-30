@@ -438,16 +438,23 @@ def drain_events() -> bool:
                 st.session_state.progress = merged
             elif payload.get("event") == "phase":
                 current = dict(st.session_state.get("progress", {}))
-                current["phase"] = str(payload.get("phase", "")).strip() or current.get("phase", "")
+                phase_value = str(payload.get("phase", "")).strip() or current.get("phase", "")
+                current["phase"] = phase_value
                 st.session_state.progress = current
+                if phase_value == "Downloading PDFs":
+                    st.session_state.awaiting_next_captcha = False
             elif payload.get("event") == "summary":
                 st.session_state.summary = payload
             elif payload.get("event") == "captcha_progress":
+                solved = int(payload.get("solved", 0))
+                total = int(payload.get("total", 0))
                 st.session_state.captcha_progress = {
-                    "total": int(payload.get("total", 0)),
-                    "solved": int(payload.get("solved", 0)),
+                    "total": total,
+                    "solved": solved,
                     "remaining": int(payload.get("remaining", 0)),
                 }
+                if total > 0 and solved >= total:
+                    st.session_state.awaiting_next_captcha = False
         elif event["type"] == "captcha":
             st.session_state.captcha_seq = int(st.session_state.get("captcha_seq", 0)) + 1
             st.session_state.captcha = event
@@ -760,25 +767,22 @@ def render_sidebar() -> None:
                 st.rerun()
 
 
-def render_run_setup() -> None:
-    with st.expander("Run Setup", expanded=True):
-        mode = str(st.session_state.get("date_mode", "Month"))
-        if mode == "Year":
-            selected = f"{int(st.session_state.get('year_value', date.today().year))}"
-        elif mode == "Month":
-            selected = (
-                f"{int(st.session_state.get('month_year_value', date.today().year))}-"
-                f"{int(st.session_state.get('month_number_value', date.today().month)):02d}"
-            )
-        else:
-            from_date = st.session_state.get("from_date_value", date.today().replace(day=1))
-            to_date = st.session_state.get("to_date_value", date.today())
-            selected = f"{from_date.isoformat()} to {to_date.isoformat()}"
-
-        c1, c2, c3 = st.columns(3)
-        c1.write(f"Date filter: `{mode}`")
-        c2.write(f"Selected range: `{selected}`")
-        c3.write(f"Output folder: `{resolve_run_output_dir()}`")
+def render_run_context_strip() -> None:
+    mode = str(st.session_state.get("date_mode", "Month"))
+    if mode == "Year":
+        selected = f"{int(st.session_state.get('year_value', date.today().year))}"
+    elif mode == "Month":
+        selected = (
+            f"{int(st.session_state.get('month_year_value', date.today().year))}-"
+            f"{int(st.session_state.get('month_number_value', date.today().month)):02d}"
+        )
+    else:
+        from_date = st.session_state.get("from_date_value", date.today().replace(day=1))
+        to_date = st.session_state.get("to_date_value", date.today())
+        selected = f"{from_date.isoformat()} to {to_date.isoformat()}"
+    st.caption(
+        f"Run summary: Date filter `{mode}` | Range `{selected}` | Output `{resolve_run_output_dir()}`"
+    )
 
 
 def render_status() -> None:
@@ -1112,7 +1116,7 @@ def main() -> None:
     render_startup_checks()
 
     render_sidebar()
-    render_run_setup()
+    render_run_context_strip()
     render_live_sections()
     if st.session_state.ui_mode == "Advanced":
         render_copy_logs_footer()
