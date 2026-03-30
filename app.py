@@ -755,8 +755,7 @@ def render_sidebar() -> None:
 
 
 def render_run_setup() -> None:
-    with st.container(border=True):
-        st.subheader("Run Setup")
+    with st.expander("Run Setup", expanded=True):
         mode = str(st.session_state.get("date_mode", "Month"))
         if mode == "Year":
             selected = f"{int(st.session_state.get('year_value', date.today().year))}"
@@ -784,8 +783,7 @@ def render_status() -> None:
 
     summary = st.session_state.summary
     if not summary:
-        with st.container(border=True):
-            st.subheader("Progress")
+        with st.expander("Progress", expanded=True):
             phase = str(progress.get("phase", "")).strip()
             if phase:
                 st.session_state.phase_dot_count = (int(st.session_state.get("phase_dot_count", 0)) % 3) + 1
@@ -980,76 +978,78 @@ def render_captcha() -> None:
 
 
 def render_outputs() -> None:
-    output_dir = st.session_state.active_output_dir
-    st.subheader("Output Files")
-    st.write(f"Current output directory: `{output_dir}`")
+    with st.container(border=True):
+        output_dir = st.session_state.active_output_dir
+        st.subheader("Output Files")
+        st.write(f"Current output directory: `{output_dir}`")
 
-    import pathlib
+        import pathlib
 
-    internal_data_dir = pathlib.Path(output_dir) / INTERNAL_DATA_DIR_NAME
-    metadata_file = internal_data_dir / "metadata.csv"
-    failed_file = internal_data_dir / "failed_downloads.csv"
-    decision_file = internal_data_dir / "decision_log.csv"
+        internal_data_dir = pathlib.Path(output_dir) / INTERNAL_DATA_DIR_NAME
+        metadata_file = internal_data_dir / "metadata.csv"
+        failed_file = internal_data_dir / "failed_downloads.csv"
+        decision_file = internal_data_dir / "decision_log.csv"
 
-    col1, col2, col3 = st.columns(3)
-    if metadata_file.exists():
-        with metadata_file.open("rb") as f:
-            col1.download_button("Download metadata.csv", data=f.read(), file_name="metadata.csv")
-    if failed_file.exists():
-        with failed_file.open("rb") as f:
-            col2.download_button("Download failed_downloads.csv", data=f.read(), file_name="failed_downloads.csv")
-    if decision_file.exists():
-        with decision_file.open("rb") as f:
-            col3.download_button("Download decision_log.csv", data=f.read(), file_name="decision_log.csv")
+        col1, col2, col3 = st.columns(3)
+        if metadata_file.exists():
+            with metadata_file.open("rb") as f:
+                col1.download_button("Download metadata.csv", data=f.read(), file_name="metadata.csv")
+        if failed_file.exists():
+            with failed_file.open("rb") as f:
+                col2.download_button("Download failed_downloads.csv", data=f.read(), file_name="failed_downloads.csv")
+        if decision_file.exists():
+            with decision_file.open("rb") as f:
+                col3.download_button("Download decision_log.csv", data=f.read(), file_name="decision_log.csv")
 
 
 def render_logs() -> None:
-    st.subheader("Logs")
-    st.text_area("Run log", value="\n".join(st.session_state.logs[-120:]), height=320)
+    with st.container(border=True):
+        st.subheader("Logs")
+        st.text_area("Run log", value="\n".join(st.session_state.logs[-120:]), height=320)
 
 
 def render_copy_logs_footer() -> None:
-    st.markdown("---")
-    st.caption("Support")
-    logs_text = "\n".join(st.session_state.logs)
-    logs_payload = json.dumps(logs_text)
-    disabled_attr = "disabled" if not logs_text else ""
-    components.html(
-        f"""
-        <div style="display:flex;align-items:center;gap:10px;">
-          <button id="copy-logs-btn" {disabled_attr}
-            style="
-              background:#111827;
-              color:#f9fafb;
-              border:1px solid #374151;
-              border-radius:8px;
-              padding:8px 12px;
-              cursor:pointer;
-              font-size:14px;">
-            Copy logs
-          </button>
-          <span id="copy-logs-status" style="font-size:13px;color:#9ca3af;"></span>
-        </div>
-        <script>
-          const btn = document.getElementById("copy-logs-btn");
-          const status = document.getElementById("copy-logs-status");
-          const text = {logs_payload};
-          if (btn) {{
-            btn.addEventListener("click", async () => {{
-              try {{
-                await navigator.clipboard.writeText(text);
-                status.textContent = "Logs copied to clipboard.";
-                status.style.color = "#22c55e";
-              }} catch (e) {{
-                status.textContent = "Clipboard blocked by browser. Please use logs from Advanced mode.";
-                status.style.color = "#f59e0b";
+    with st.container(border=True):
+        st.subheader("Support")
+        logs_text = "\n".join(st.session_state.logs)
+        logs_payload = json.dumps(logs_text)
+        disabled_attr = "disabled" if not logs_text else ""
+        components.html(
+            f"""
+            <div style="display:flex;align-items:center;gap:10px;">
+              <button id="copy-logs-btn" {disabled_attr}
+                style="
+                  background:#111827;
+                  color:#f9fafb;
+                  border:1px solid #374151;
+                  border-radius:8px;
+                  padding:8px 12px;
+                  cursor:pointer;
+                  font-size:14px;">
+                Copy logs
+              </button>
+              <span id="copy-logs-status" style="font-size:13px;color:#9ca3af;"></span>
+            </div>
+            <script>
+              const btn = document.getElementById("copy-logs-btn");
+              const status = document.getElementById("copy-logs-status");
+              const text = {logs_payload};
+              if (btn) {{
+                btn.addEventListener("click", async () => {{
+                  try {{
+                    await navigator.clipboard.writeText(text);
+                    status.textContent = "Logs copied to clipboard.";
+                    status.style.color = "#22c55e";
+                  }} catch (e) {{
+                    status.textContent = "Clipboard blocked by browser. Please use logs from Advanced mode.";
+                    status.style.color = "#f59e0b";
+                  }}
+                }});
               }}
-            }});
-          }}
-        </script>
-        """,
-        height=70,
-    )
+            </script>
+            """,
+            height=90,
+        )
 
 
 @st.fragment(run_every="1s")
@@ -1072,6 +1072,12 @@ def main() -> None:
             max-width: 1000px;
             padding-top: 2rem;
             padding-bottom: 2rem;
+          }
+          /* Make expander headers read like section titles */
+          div[data-testid="stExpander"] details summary p {
+            font-size: 1.8rem !important;
+            font-weight: 700 !important;
+            line-height: 1.2 !important;
           }
         </style>
         """,
