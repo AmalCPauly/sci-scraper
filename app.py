@@ -808,22 +808,7 @@ def render_status() -> None:
 
             started_at = float(st.session_state.get("run_started_at_monotonic", 0.0) or 0.0)
             elapsed_seconds = max(0.0, time.monotonic() - started_at) if started_at > 0 else 0.0
-            eta_text = "Pending downloads..."
-            if total > 0 and completed >= 5 and elapsed_seconds > 0 and completed < total:
-                throughput = completed / elapsed_seconds
-                if throughput > 0:
-                    eta_seconds = max(0.0, (total - completed) / throughput)
-                    eta_text = format_duration_whole_seconds(eta_seconds)
-                else:
-                    eta_text = "Calculating..."
-            elif total > 0 and completed >= total:
-                eta_text = "0s"
-            elif total > 0 and completed > 0:
-                eta_text = "Calculating..."
-
-            t1, t2 = st.columns(2)
-            t1.write(f"Elapsed time: `{format_duration_whole_seconds(elapsed_seconds)}`")
-            t2.write(f"ETA: `{eta_text}`")
+            st.write(f"Elapsed time: `{format_duration_whole_seconds(elapsed_seconds)}`")
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Downloaded", progress.get("downloaded", 0))
