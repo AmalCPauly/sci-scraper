@@ -483,6 +483,9 @@ def drain_events() -> bool:
             st.session_state.awaiting_next_captcha = False
             st.session_state.show_success_banner = False
             st.session_state.stop_notice = True
+            current = dict(st.session_state.get("progress", {}))
+            current["phase"] = "Download stopped"
+            st.session_state.progress = current
             st.session_state.exit_cleanup_count = cleanup_partial_downloads(
                 st.session_state.get("active_output_dir", resolve_run_output_dir())
             )
@@ -796,9 +799,12 @@ def render_status() -> None:
         with st.expander("Progress", expanded=True):
             phase = str(progress.get("phase", "")).strip()
             if phase:
-                st.session_state.phase_dot_count = (int(st.session_state.get("phase_dot_count", 0)) % 3) + 1
-                dot_count = int(st.session_state.phase_dot_count)
-                st.caption(f"{phase}{'.' * dot_count}")
+                if phase == "Download stopped":
+                    st.caption(phase)
+                else:
+                    st.session_state.phase_dot_count = (int(st.session_state.get("phase_dot_count", 0)) % 3) + 1
+                    dot_count = int(st.session_state.phase_dot_count)
+                    st.caption(f"{phase}{'.' * dot_count}")
             progress_text = (
                 f"{completed} / {total} completed"
                 if total
@@ -852,14 +858,12 @@ def render_captcha() -> None:
 
     challenge = st.session_state.captcha
     solve_mode = str(st.session_state.get("captcha_solve_mode", "solve_all_first"))
+    awaiting_next = bool(st.session_state.get("awaiting_next_captcha", False))
     keep_card_while_waiting = (
         challenge is None
         and st.session_state.get("run_active", False)
         and solve_mode == "solve_all_first"
-        and (
-            bool(st.session_state.get("awaiting_next_captcha", False))
-            or (total > 0 and solved < total)
-        )
+        and (awaiting_next or (total > 0 and solved == 0))
     )
     if not challenge and not keep_card_while_waiting:
         return
@@ -871,7 +875,8 @@ def render_captcha() -> None:
             ratio = max(0.0, min(1.0, solved / total))
             st.progress(ratio)
         if challenge is None:
-            st.info("Loading next CAPTCHA...")
+            loading_text = "Loading CAPTCHA..." if solved == 0 else "Loading next CAPTCHA..."
+            st.info(loading_text)
         else:
             st.write("Enter the CAPTCHA result below.")
             st.image(challenge["path"], use_container_width=False)
@@ -893,7 +898,8 @@ def render_captcha() -> None:
                 else:
                     st.session_state.bridge.submit_answer(answer_str)
                     st.session_state.captcha = None
-                    st.session_state.awaiting_next_captcha = True
+                    # Keep waiting state only if at least one more CAPTCHA is expected.
+                    st.session_state.awaiting_next_captcha = (total == 0) or ((solved + 1) < total)
                     st.rerun()
 
             if st.button("Refresh CAPTCHA"):
@@ -1072,11 +1078,17 @@ def main() -> None:
             padding-top: 2rem;
             padding-bottom: 2rem;
           }
-          /* Make expander headers read like section titles */
-          div[data-testid="stExpander"] details summary p {
+          /* Make main-area expander headers read like section titles */
+          section[data-testid="stMain"] div[data-testid="stExpander"] details summary p {
             font-size: 1.8rem !important;
             font-weight: 700 !important;
             line-height: 1.2 !important;
+          }
+          /* Keep sidebar expander headers at normal size (e.g., Diagnostics) */
+          section[data-testid="stSidebar"] div[data-testid="stExpander"] details summary p {
+            font-size: 1rem !important;
+            font-weight: 400 !important;
+            line-height: 1.4 !important;
           }
         </style>
         """,
